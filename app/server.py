@@ -12,8 +12,10 @@ import os
 import shlex
 import subprocess
 from pathlib import Path
+from urllib.parse import quote
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
+from werkzeug.utils import secure_filename
 
 MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "/media")).resolve()
 HOST = os.environ.get("HOST", "0.0.0.0")
@@ -21,6 +23,8 @@ PORT = int(os.environ.get("PORT", "8080"))
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v", ".flv", ".wmv"}
 SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+DOWNLOADABLE_SUBTITLE_EXTS = SUBTITLE_EXTS | {".sup"}
+TMP_SUBTITLE_ROOT = MEDIA_DIR / ".tmp_subtitles"
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
@@ -38,9 +42,79 @@ def rel_to_media(p: Path) -> str:
     return str(p.relative_to(MEDIA_DIR)).replace("\\", "/")
 
 
+def _video_temp_dir(video: Path) -> Path:
+    rel_parent = video.relative_to(MEDIA_DIR).parent
+    safe_name = secure_filename(video.name)
+    return (TMP_SUBTITLE_ROOT / rel_parent / safe_name).resolve()
+
+
+def _validate_output_name(name: str | None, default_name: str) -> str:
+    if not name:
+        return default_name
+    candidate = Path(name)
+    if candidate.name != name or candidate.parent != Path("."):
+        raise ValueError("invalid output name")
+    return name
+
+
+def _list_uploaded_subtitles(video: Path) -> list[dict]:
+    temp_dir = _video_temp_dir(video)
+    if not temp_dir.exists() or not temp_dir.is_dir():
+        return []
+
+    entries = []
+    for child in sorted(temp_dir.iterdir(), key=lambda p: p.name.lower()):
+        if not child.is_file() or child.suffix.lower() not in SUBTITLE_EXTS:
+            continue
+        entries.append({
+            "name": child.name,
+            "path": rel_to_media(child),
+            "kind": "file",
+            "role": "subtitle",
+            "size": child.stat().st_size,
+            "source": "upload",
+        })
+    return entries
+
+
+def _is_temp_subtitle(path: Path, video: Path) -> bool:
+    temp_dir = _video_temp_dir(video)
+    return path == temp_dir or temp_dir in path.parents
+
+
+def _unique_file_path(parent: Path, filename: str) -> Path:
+    candidate = parent / filename
+    if not candidate.exists():
+        return candidate
+
+    stem = Path(filename).stem
+    suffix = Path(filename).suffix
+    index = 1
+    while True:
+        candidate = parent / f"{stem}-{index}{suffix}"
+        if not candidate.exists():
+            return candidate
+        index += 1
+
+
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/download")
+def api_download():
+    rel = request.args.get("path", "")
+    try:
+        target = safe_path(rel)
+    except ValueError:
+        return jsonify(error="invalid path"), 400
+    if not target.is_file():
+        return jsonify(error="not a file"), 404
+    if target.suffix.lower() not in DOWNLOADABLE_SUBTITLE_EXTS:
+        return jsonify(error="unsupported file type"), 400
+
+    return send_file(target, as_attachment=True, download_name=target.name)
 
 
 @app.route("/api/list")
@@ -125,6 +199,7 @@ def api_probe():
         "format": data.get("format", {}),
         "streams": streams,
         "subtitles": subtitles,
+        "uploaded_subtitles": _list_uploaded_subtitles(target),
     })
 
 
@@ -161,11 +236,12 @@ def api_extract():
         return jsonify(error="not a file"), 404
 
     ext = _codec_to_ext(codec)
-    if not out_name:
-        out_name = f"{target.stem}.track{stream_index}{ext}"
-    else:
-        if Path(out_name).suffix.lower() not in (ext, ".srt", ".ass", ".vtt"):
-            out_name = out_name + ext
+    try:
+        out_name = _validate_output_name(out_name, f"{target.stem}.track{stream_index}{ext}")
+    except ValueError:
+        return jsonify(error="invalid output name"), 400
+    if Path(out_name).suffix.lower() not in (ext, ".srt", ".ass", ".vtt"):
+        out_name = out_name + ext
 
     out_path = (target.parent / out_name).resolve()
     if MEDIA_DIR not in out_path.parents and out_path != MEDIA_DIR:
@@ -198,7 +274,43 @@ def api_extract():
     return jsonify({
         "ok": True,
         "output": rel_to_media(out_path),
+        "download_url": f"/api/download?path={quote(rel_to_media(out_path), safe='')}",
         "cmd": " ".join(shlex.quote(c) for c in cmd),
+    })
+
+
+@app.route("/api/upload-subtitle", methods=["POST"])
+def api_upload_subtitle():
+    video_rel = request.form.get("video", "")
+    file = request.files.get("file")
+
+    if not video_rel or file is None:
+        return jsonify(error="video and file required"), 400
+
+    try:
+        video = safe_path(video_rel)
+    except ValueError:
+        return jsonify(error="invalid video path"), 400
+    if not video.is_file():
+        return jsonify(error="video not found"), 404
+    if video.suffix.lower() not in VIDEO_EXTS:
+        return jsonify(error="unsupported video type"), 400
+
+    filename = secure_filename(file.filename or "")
+    ext = Path(filename).suffix.lower()
+    if not filename or ext not in SUBTITLE_EXTS:
+        return jsonify(error="unsupported subtitle type"), 400
+
+    temp_dir = _video_temp_dir(video)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    out_path = _unique_file_path(temp_dir, filename)
+    file.save(out_path)
+
+    return jsonify({
+        "ok": True,
+        "path": rel_to_media(out_path),
+        "name": out_path.name,
+        "size": out_path.stat().st_size,
     })
 
 
@@ -220,8 +332,11 @@ def api_embed():
         return jsonify(error="invalid video path"), 400
     if not video.is_file():
         return jsonify(error="video not found"), 404
+    if video.suffix.lower() not in VIDEO_EXTS:
+        return jsonify(error="unsupported video type"), 400
 
     sub_paths = []
+    temp_files_to_cleanup = []
     for s in subs:
         try:
             sp = safe_path(s.get("path", ""))
@@ -229,10 +344,16 @@ def api_embed():
             return jsonify(error=f"invalid subtitle path: {s.get('path')}"), 400
         if not sp.is_file():
             return jsonify(error=f"subtitle not found: {s.get('path')}"), 404
+        if sp.suffix.lower() not in SUBTITLE_EXTS:
+            return jsonify(error=f"unsupported subtitle type: {s.get('path')}"), 400
+        if _is_temp_subtitle(sp, video):
+            temp_files_to_cleanup.append(sp)
         sub_paths.append((sp, s))
 
-    if not out_name:
-        out_name = f"{video.stem}.muxed.mkv"
+    try:
+        out_name = _validate_output_name(out_name, f"{video.stem}.muxed.mkv")
+    except ValueError:
+        return jsonify(error="invalid output name"), 400
     if not out_name.lower().endswith(".mkv"):
         out_name += ".mkv"
     out_path = (video.parent / out_name).resolve()
@@ -285,6 +406,13 @@ def api_embed():
     except subprocess.CalledProcessError as exc:
         return jsonify(error="ffmpeg failed", cmd=" ".join(shlex.quote(c) for c in cmd),
                        detail=exc.output.decode(errors="ignore")), 500
+
+    for temp_file in temp_files_to_cleanup:
+        if temp_file.exists():
+            temp_file.unlink()
+    temp_dir = _video_temp_dir(video)
+    if temp_dir.exists() and temp_dir.is_dir() and not any(temp_dir.iterdir()):
+        temp_dir.rmdir()
 
     return jsonify({
         "ok": True,

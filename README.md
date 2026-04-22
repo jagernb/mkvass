@@ -4,12 +4,13 @@
 
 - 浏览挂载目录，列出视频 / 字幕文件
 - 查看视频的内封字幕轨道（ffprobe）
-- **提取**某条字幕轨道为 `.srt` / `.ass` / `.vtt`（位图字幕导出为 `.sup`）
+- **提取**某条字幕轨道为 `.srt` / `.ass` / `.vtt`（位图字幕导出为 `.sup`，并支持浏览器直接下载）
 - 将同目录下的外挂字幕**封装**为软字幕写入 `.mkv`（可多轨、可标记默认、可保留原有字幕）
+- 在浏览器中上传外挂字幕到临时区，并直接参与当前视频的封装
 
 ## 目录结构
 
-```
+```text
 .
 ├── Dockerfile
 ├── docker-compose.yml
@@ -44,14 +45,17 @@ volumes:
 
 ## 说明
 
-- **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`。
+- **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`，操作完成后可直接在浏览器点击下载。
 - **封装**：默认输出 `<原名>.muxed.mkv`。音视频流直接 copy，不重新编码，速度很快；字幕统一转为 `srt` 写入 MKV。位图字幕（PGS/DVD/DVB）在 MKV 中同样支持但只能 copy，此工具的封装流程默认转为 srt，如需保留位图请在封装前手动处理。
+- **临时上传字幕**：浏览器上传的 `.srt/.ass/.ssa/.vtt/.sub` 会保存到按视频文件名隔离的隐藏临时目录，只在当前视频详情中显示；封装成功后会清理本次参与封装的临时字幕，封装失败时会保留以便重试。
 - 所有 ffmpeg / ffprobe 命令都会在操作结果中展示，方便你了解实际调用。
 - API 只允许访问 `/media` 目录内的文件，防止路径穿越。
 
 ## 常用 API
 
 - `GET /api/list?path=` 列目录
-- `GET /api/probe?path=<视频>` 查看流信息
+- `GET /api/probe?path=<视频>` 查看流信息，并返回当前视频的临时上传字幕
+- `GET /api/download?path=<字幕路径>` 下载提取出的字幕文件
 - `POST /api/extract` body: `{path, stream_index, codec}`
+- `POST /api/upload-subtitle` form-data: `video=<视频路径>`, `file=<字幕文件>`
 - `POST /api/embed` body: `{video, subtitles:[{path,language,title,default}], keep_existing, out_name}`

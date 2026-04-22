@@ -42,6 +42,8 @@
          font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; }
   .pill { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #2a2f3a;
           font-size: 11px; margin-right: 4px; }
+  .link-btn { color: #8ab4ff; text-decoration: none; font-size: 13px; }
+  .tag.temp { background: #7c4dff33; color: #c9b3ff; }
 </style>
 </head>
 <body>
@@ -76,6 +78,16 @@ function bytes(n) {
   let i = 0;
   while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
   return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+
+function escapeHtml(value) {
+  return String(value ?? '').replace(/[&<>"']/g, ch => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[ch]));
 }
 
 async function loadDir(path='') {
@@ -143,9 +155,9 @@ function renderDetail(entry, probe) {
   const c = document.getElementById('content');
   const subs = probe.subtitles || [];
 
-  // 同目录下的外挂字幕
-  const dir = entry.path.split('/').slice(0, -1).join('/');
   const siblingSubs = state.entries.filter(e => e.role === 'subtitle');
+  const uploadedSubs = probe.uploaded_subtitles || [];
+  const embedCandidates = [...siblingSubs, ...uploadedSubs];
 
   let subRows = subs.length ? subs.map(s => `
     <tr>
@@ -158,15 +170,19 @@ function renderDetail(entry, probe) {
       </td>
     </tr>`).join('') : '<tr><td colspan="5" class="muted">没有内封字幕轨道</td></tr>';
 
-  let subOptions = siblingSubs.map(s =>
-    `<label style="display:block;padding:4px 0">
-       <input type="checkbox" class="embed-sub" data-path="${s.path}">
-       ${s.name}
+  let subOptions = embedCandidates.map(s => {
+    const isUpload = s.source === 'upload';
+    const sourceTag = isUpload ? '<span class="tag temp">临时</span>' : '<span class="tag subtitle">目录</span>';
+    return `<label style="display:block;padding:4px 0">
+       <input type="checkbox" class="embed-sub" data-path="${escapeHtml(s.path)}">
+       ${sourceTag}
+       ${escapeHtml(s.name)}
        <input type="text" placeholder="语言(如 chi/eng)" class="embed-lang" style="width:100px" value="und">
        <input type="text" placeholder="标题" class="embed-title" style="width:140px">
        <label class="muted"><input type="checkbox" class="embed-default"> 默认</label>
-     </label>`).join('');
-  if (!subOptions) subOptions = '<div class="muted">当前目录没有 .srt/.ass/.vtt 字幕文件</div>';
+     </label>`;
+  }).join('');
+  if (!subOptions) subOptions = '<div class="muted">当前没有可用于封装的字幕文件</div>';
 
   c.innerHTML = `
     <section>
@@ -190,6 +206,10 @@ function renderDetail(entry, probe) {
 
     <section>
       <h2>外挂字幕封装（软字幕 → MKV）</h2>
+      <div class="row" style="margin-bottom:10px">
+        <input type="file" id="uploadSubtitleFile" accept=".srt,.ass,.ssa,.vtt,.sub">
+        <button id="uploadSubtitleBtn" class="secondary">上传到临时区</button>
+      </div>
       ${subOptions}
       <div class="row" style="margin-top:10px">
         <label><input type="checkbox" id="keepExisting" checked> 保留原有内封字幕</label>
@@ -203,6 +223,7 @@ function renderDetail(entry, probe) {
   c.querySelectorAll('[data-extract]').forEach(btn => {
     btn.onclick = () => doExtract(entry, JSON.parse(btn.dataset.extract), btn);
   });
+  document.getElementById('uploadSubtitleBtn').onclick = () => uploadSubtitle(entry);
   document.getElementById('doEmbed').onclick = () => doEmbed(entry);
 }
 
@@ -217,12 +238,47 @@ async function doExtract(entry, info, btn) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ path: entry.path, stream_index: info.stream_index, codec: info.codec }),
     });
-    log.textContent = '已生成: ' + res.output + '\n\n' + res.cmd;
+    log.innerHTML = `已生成: ${escapeHtml(res.output)}\n<a class="link-btn" href="${escapeHtml(res.download_url)}">下载字幕</a>\n\n${escapeHtml(res.cmd)}`;
     await loadDir(state.cwd);
   } catch (e) {
     log.textContent = '失败: ' + e.message;
   } finally {
     btn.disabled = false;
+  }
+}
+
+async function uploadSubtitle(entry) {
+  const log = document.getElementById('embedLog');
+  const input = document.getElementById('uploadSubtitleFile');
+  const btn = document.getElementById('uploadSubtitleBtn');
+  const file = input.files && input.files[0];
+  log.style.display = '';
+  if (!file) {
+    log.textContent = '请先选择一个字幕文件';
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('video', entry.path);
+  formData.append('file', file);
+
+  btn.disabled = true;
+  log.textContent = '上传中...';
+  try {
+    await api('/api/upload-subtitle', {
+      method: 'POST',
+      body: formData,
+    });
+    await showVideo(entry);
+    document.getElementById('uploadSubtitleFile').value = '';
+    const nextLog = document.getElementById('embedLog');
+    nextLog.style.display = '';
+    nextLog.textContent = '上传成功，已加入当前视频的临时字幕列表';
+  } catch (e) {
+    log.textContent = '失败: ' + e.message;
+  } finally {
+    const nextBtn = document.getElementById('uploadSubtitleBtn');
+    if (nextBtn) nextBtn.disabled = false;
   }
 }
 
