@@ -1,0 +1,270 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>字幕提取/封装工具</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, Segoe UI, Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #0f1115; color: #e6e6e6; }
+  header { padding: 14px 20px; background: #161a22; border-bottom: 1px solid #222;
+           display: flex; align-items: center; gap: 14px; }
+  header h1 { font-size: 16px; margin: 0; }
+  .crumbs { color: #8ab4ff; font-size: 13px; word-break: break-all; }
+  main { display: grid; grid-template-columns: 360px 1fr; gap: 0; min-height: calc(100vh - 52px); }
+  #browser { border-right: 1px solid #222; overflow: auto; }
+  #detail { padding: 16px 20px; overflow: auto; }
+  ul.list { list-style: none; padding: 0; margin: 0; }
+  ul.list li { padding: 8px 14px; border-bottom: 1px solid #1a1d24; cursor: pointer;
+               display: flex; gap: 8px; align-items: center; font-size: 14px; }
+  ul.list li:hover { background: #1b2030; }
+  ul.list li.active { background: #25314d; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #2a2f3a; color: #aaa; }
+  .tag.video { background: #1e4fff33; color: #8ab4ff; }
+  .tag.subtitle { background: #00b37633; color: #00e39d; }
+  .tag.dir { background: #ffb94733; color: #ffb947; }
+  .muted { color: #888; font-size: 12px; }
+  button { background: #2b64ff; color: #fff; border: 0; padding: 6px 14px; border-radius: 6px;
+           cursor: pointer; font-size: 13px; }
+  button.secondary { background: #2a2f3a; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  th, td { padding: 6px 8px; border-bottom: 1px solid #222; text-align: left; }
+  th { color: #8ab4ff; font-weight: normal; }
+  section { margin-bottom: 22px; padding: 14px; background: #161a22; border-radius: 8px; }
+  section h2 { margin: 0 0 10px; font-size: 14px; color: #8ab4ff; }
+  input[type=text], select { background: #0f1115; color: #e6e6e6; border: 1px solid #2a2f3a;
+           padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .log { background: #000; color: #7fd; padding: 10px; border-radius: 6px; font-family: monospace;
+         font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; }
+  .pill { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #2a2f3a;
+          font-size: 11px; margin-right: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>字幕提取/封装</h1>
+  <span class="crumbs" id="crumbs">/</span>
+  <span style="margin-left:auto" class="muted">媒体目录挂载在容器 /media</span>
+</header>
+<main>
+  <div id="browser">
+    <ul class="list" id="fileList"></ul>
+  </div>
+  <div id="detail">
+    <div id="empty" class="muted">选择一个视频文件查看字幕轨道。</div>
+    <div id="content" style="display:none"></div>
+  </div>
+</main>
+
+<script>
+let state = { cwd: '', entries: [], selected: null, probe: null };
+
+async function api(path, opts={}) {
+  const res = await fetch(path, opts);
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || res.statusText);
+  return data;
+}
+
+function bytes(n) {
+  if (n == null) return '';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length-1) { n /= 1024; i++; }
+  return n.toFixed(i ? 1 : 0) + ' ' + u[i];
+}
+
+async function loadDir(path='') {
+  const data = await api('/api/list?path=' + encodeURIComponent(path));
+  state.cwd = data.cwd;
+  state.entries = data.entries;
+  state.parent = data.parent;
+  renderList();
+  document.getElementById('crumbs').textContent = '/' + (data.cwd || '');
+}
+
+function renderList() {
+  const ul = document.getElementById('fileList');
+  ul.innerHTML = '';
+  if (state.parent !== null && state.parent !== undefined) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span class="tag dir">..</span><span>上级目录</span>';
+    li.onclick = () => loadDir(state.parent);
+    ul.appendChild(li);
+  }
+  for (const e of state.entries) {
+    const li = document.createElement('li');
+    const tag = e.kind === 'dir' ? '<span class="tag dir">DIR</span>'
+              : e.role === 'video' ? '<span class="tag video">VIDEO</span>'
+              : e.role === 'subtitle' ? '<span class="tag subtitle">SUB</span>'
+              : '<span class="tag">FILE</span>';
+    li.innerHTML = `${tag}<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.name}</span>`
+                 + (e.size != null ? `<span class="muted">${bytes(e.size)}</span>` : '');
+    li.onclick = () => onClickEntry(e, li);
+    ul.appendChild(li);
+  }
+}
+
+async function onClickEntry(e, li) {
+  if (e.kind === 'dir') { loadDir(e.path); return; }
+  document.querySelectorAll('#fileList li').forEach(x => x.classList.remove('active'));
+  li.classList.add('active');
+  if (e.role === 'video') {
+    state.selected = e;
+    await showVideo(e);
+  } else {
+    document.getElementById('content').style.display = 'none';
+    document.getElementById('empty').style.display = '';
+    document.getElementById('empty').textContent = '仅支持视频文件的字幕操作。';
+  }
+}
+
+async function showVideo(entry) {
+  document.getElementById('empty').style.display = 'none';
+  const c = document.getElementById('content');
+  c.style.display = '';
+  c.innerHTML = `<section><h2>${entry.name}</h2><div class="muted">探测中...</div></section>`;
+  let probe;
+  try {
+    probe = await api('/api/probe?path=' + encodeURIComponent(entry.path));
+  } catch (err) {
+    c.innerHTML = `<section><h2>${entry.name}</h2><div style="color:#f66">探测失败: ${err.message}</div></section>`;
+    return;
+  }
+  state.probe = probe;
+  renderDetail(entry, probe);
+}
+
+function renderDetail(entry, probe) {
+  const c = document.getElementById('content');
+  const subs = probe.subtitles || [];
+
+  // 同目录下的外挂字幕
+  const dir = entry.path.split('/').slice(0, -1).join('/');
+  const siblingSubs = state.entries.filter(e => e.role === 'subtitle');
+
+  let subRows = subs.length ? subs.map(s => `
+    <tr>
+      <td>#${s.index}</td>
+      <td>${s.codec || ''}</td>
+      <td>${s.language || ''}</td>
+      <td>${s.title || ''}</td>
+      <td>
+        <button data-extract='${JSON.stringify({stream_index:s.index, codec:s.codec})}'>提取</button>
+      </td>
+    </tr>`).join('') : '<tr><td colspan="5" class="muted">没有内封字幕轨道</td></tr>';
+
+  let subOptions = siblingSubs.map(s =>
+    `<label style="display:block;padding:4px 0">
+       <input type="checkbox" class="embed-sub" data-path="${s.path}">
+       ${s.name}
+       <input type="text" placeholder="语言(如 chi/eng)" class="embed-lang" style="width:100px" value="und">
+       <input type="text" placeholder="标题" class="embed-title" style="width:140px">
+       <label class="muted"><input type="checkbox" class="embed-default"> 默认</label>
+     </label>`).join('');
+  if (!subOptions) subOptions = '<div class="muted">当前目录没有 .srt/.ass/.vtt 字幕文件</div>';
+
+  c.innerHTML = `
+    <section>
+      <h2>文件信息</h2>
+      <div class="muted">${entry.path}</div>
+      <div class="row" style="margin-top:6px">
+        <span class="pill">${bytes(entry.size)}</span>
+        <span class="pill">格式: ${probe.format?.format_name || ''}</span>
+        <span class="pill">时长: ${probe.format?.duration ? Number(probe.format.duration).toFixed(1)+'s' : ''}</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>内封字幕轨道（提取）</h2>
+      <table>
+        <tr><th>索引</th><th>编码</th><th>语言</th><th>标题</th><th></th></tr>
+        ${subRows}
+      </table>
+      <div class="log" id="extractLog" style="display:none"></div>
+    </section>
+
+    <section>
+      <h2>外挂字幕封装（软字幕 → MKV）</h2>
+      ${subOptions}
+      <div class="row" style="margin-top:10px">
+        <label><input type="checkbox" id="keepExisting" checked> 保留原有内封字幕</label>
+        <input type="text" id="outName" placeholder="输出文件名（默认 *.muxed.mkv）" style="flex:1;min-width:260px">
+        <button id="doEmbed">封装</button>
+      </div>
+      <div class="log" id="embedLog" style="display:none"></div>
+    </section>
+  `;
+
+  c.querySelectorAll('[data-extract]').forEach(btn => {
+    btn.onclick = () => doExtract(entry, JSON.parse(btn.dataset.extract), btn);
+  });
+  document.getElementById('doEmbed').onclick = () => doEmbed(entry);
+}
+
+async function doExtract(entry, info, btn) {
+  const log = document.getElementById('extractLog');
+  log.style.display = '';
+  log.textContent = '提取中...';
+  btn.disabled = true;
+  try {
+    const res = await api('/api/extract', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ path: entry.path, stream_index: info.stream_index, codec: info.codec }),
+    });
+    log.textContent = '已生成: ' + res.output + '\n\n' + res.cmd;
+    await loadDir(state.cwd);
+  } catch (e) {
+    log.textContent = '失败: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function doEmbed(entry) {
+  const log = document.getElementById('embedLog');
+  log.style.display = '';
+  const checks = [...document.querySelectorAll('.embed-sub:checked')];
+  if (!checks.length) { log.textContent = '请至少选择一个字幕文件'; return; }
+  const subs = checks.map(cb => {
+    const row = cb.parentElement;
+    return {
+      path: cb.dataset.path,
+      language: row.querySelector('.embed-lang').value || 'und',
+      title: row.querySelector('.embed-title').value || '',
+      default: row.querySelector('.embed-default').checked,
+    };
+  });
+  const body = {
+    video: entry.path,
+    subtitles: subs,
+    keep_existing: document.getElementById('keepExisting').checked,
+    out_name: document.getElementById('outName').value || null,
+  };
+  log.textContent = '封装中（可能较慢，请勿关闭页面）...';
+  const btn = document.getElementById('doEmbed');
+  btn.disabled = true;
+  try {
+    const res = await api('/api/embed', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    log.textContent = '已生成: ' + res.output + '\n\n' + res.cmd;
+    await loadDir(state.cwd);
+  } catch (e) {
+    log.textContent = '失败: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+loadDir('');
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+services:
+  subtitle-tool:
+    build: .
+    image: subtitle-tool:latest
+    container_name: subtitle-tool
+    ports:
+      - "8083:8080"
+    volumes:
+      # 把你的视频目录挂载到容器的 /media
+      - ./media:/media
+    environment:
+      - MEDIA_DIR=/media
+      - PORT=8080
+    restart: unless-stopped
