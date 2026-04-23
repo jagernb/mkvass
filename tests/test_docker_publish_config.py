@@ -7,7 +7,8 @@ class DockerPublishingConfigTests(unittest.TestCase):
         compose = Path("docker-compose.yml").read_text(encoding="utf-8")
         self.assertIn("image: jagernb/mkvass:${MKVASS_TAG:-latest}", compose)
         self.assertIn("DEFAULT_OUTPUT_DIR=output", compose)
-        self.assertIn("ASS_TO_PGS_CMD=", compose)
+        self.assertIn("PGS_CONVERTER_CMD=mkvtool", compose)
+        self.assertIn("PGS_FONT_DIR=/usr/share/fonts/truetype/dejavu", compose)
         self.assertNotIn("build:", compose)
 
     def test_workflow_pushes_image_to_docker_hub(self):

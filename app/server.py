@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -23,10 +24,10 @@ MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "/media")).resolve()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 DEFAULT_OUTPUT_DIR = (os.environ.get("DEFAULT_OUTPUT_DIR") or "").strip()
-ASS_TO_PGS_CMD = (os.environ.get("ASS_TO_PGS_CMD") or "").strip()
-ASS_TO_PGS_FONT_DIR = (os.environ.get("ASS_TO_PGS_FONT_DIR") or "/app/ass_to_pgs/font").strip()
-ASS_TO_PGS_FRAMERATE = (os.environ.get("ASS_TO_PGS_FRAMERATE") or "23.976").strip() or "23.976"
-ASS_TO_PGS_RESOLUTION = (os.environ.get("ASS_TO_PGS_RESOLUTION") or "1080p").strip() or "1080p"
+PGS_CONVERTER_CMD = (os.environ.get("PGS_CONVERTER_CMD") or os.environ.get("ASS_TO_PGS_CMD") or "mkvtool").strip()
+PGS_FONT_DIR = (os.environ.get("PGS_FONT_DIR") or os.environ.get("ASS_TO_PGS_FONT_DIR") or "/usr/share/fonts/truetype/dejavu").strip()
+PGS_FRAMERATE = (os.environ.get("PGS_FRAMERATE") or os.environ.get("ASS_TO_PGS_FRAMERATE") or "23.976").strip() or "23.976"
+PGS_RESOLUTION = (os.environ.get("PGS_RESOLUTION") or os.environ.get("ASS_TO_PGS_RESOLUTION") or "1920*1080").strip() or "1920*1080"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v", ".flv", ".wmv"}
 SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
@@ -103,18 +104,18 @@ def _unique_file_path(parent: Path, filename: str) -> Path:
         index += 1
 
 
-def _resolve_ass_to_pgs_command() -> str | None:
-    if not ASS_TO_PGS_CMD:
+def _resolve_pgs_converter_command() -> str | None:
+    if not PGS_CONVERTER_CMD:
         return None
-    candidate = Path(ASS_TO_PGS_CMD)
+    candidate = Path(PGS_CONVERTER_CMD)
     if candidate.is_file():
         return str(candidate.resolve())
-    return shutil.which(ASS_TO_PGS_CMD)
+    return shutil.which(PGS_CONVERTER_CMD)
 
 
-def _ass_to_pgs_available() -> bool:
-    tool = _resolve_ass_to_pgs_command()
-    font_dir = Path(ASS_TO_PGS_FONT_DIR) if ASS_TO_PGS_FONT_DIR else None
+def _pgs_converter_available() -> bool:
+    tool = _resolve_pgs_converter_command()
+    font_dir = Path(PGS_FONT_DIR) if PGS_FONT_DIR else None
     return bool(tool and font_dir and font_dir.is_dir())
 
 
@@ -164,47 +165,140 @@ def _count_subtitle_streams(video: Path) -> int:
     return len(json.loads(probe.decode()).get("streams", []))
 
 
-def _convert_ass_to_pgs(subtitle_path: Path) -> tuple[Path, str, Path]:
+def _video_dimensions(video: Path) -> tuple[int, int] | None:
+    probe = subprocess.check_output([
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=width,height", "-of", "json", str(video),
+    ], timeout=60)
+    streams = json.loads(probe.decode()).get("streams", [])
+    if not streams:
+        return None
+    width = streams[0].get("width")
+    height = streams[0].get("height")
+    if not isinstance(width, int) or not isinstance(height, int):
+        return None
+    if width <= 0 or height <= 0:
+        return None
+    return width, height
+
+
+def _pgs_defaults() -> dict:
+    return {
+        "resolution": PGS_RESOLUTION,
+        "framerate": PGS_FRAMERATE,
+        "font_dir": PGS_FONT_DIR,
+        "resolution_mode": "video",
+    }
+
+
+def _normalize_embed_settings(body: dict) -> dict:
+    settings = body.get("settings") if isinstance(body.get("settings"), dict) else {}
+    output_settings = settings.get("output") if isinstance(settings.get("output"), dict) else {}
+    pgs_settings = settings.get("pgs") if isinstance(settings.get("pgs"), dict) else {}
+    raw_pgs_options = body.get("pgs_options") if isinstance(body.get("pgs_options"), dict) else {}
+
+    use_default_output_dir = output_settings.get("use_default_output_dir")
+    if use_default_output_dir is None:
+        use_default_output_dir = body.get("use_default_output_dir", False)
+
+    resolution_mode = pgs_settings.get("resolution_mode") or raw_pgs_options.get("resolution_mode") or "video"
+    resolution = pgs_settings.get("resolution") or raw_pgs_options.get("resolution") or PGS_RESOLUTION
+    framerate = pgs_settings.get("framerate") or raw_pgs_options.get("framerate") or PGS_FRAMERATE
+
+    return {
+        "use_default_output_dir": bool(use_default_output_dir),
+        "pgs_options": {
+            "resolution_mode": str(resolution_mode).strip() or "video",
+            "resolution": str(resolution).strip() or PGS_RESOLUTION,
+            "framerate": str(framerate).strip() or PGS_FRAMERATE,
+        },
+    }
+
+
+def _validate_pgs_options(pgs_options: dict) -> dict:
+    resolution_mode = (pgs_options.get("resolution_mode") or "video").strip().lower()
+    if resolution_mode not in {"video", "custom"}:
+        raise ValueError("invalid pgs resolution mode")
+
+    resolution = (pgs_options.get("resolution") or PGS_RESOLUTION).strip()
+    if resolution_mode == "custom":
+        if not re.fullmatch(r"\d+\*\d+", resolution):
+            raise ValueError("invalid pgs resolution")
+        width, height = (int(part) for part in resolution.split("*", 1))
+        if width <= 0 or height <= 0:
+            raise ValueError("invalid pgs resolution")
+
+    framerate = (pgs_options.get("framerate") or PGS_FRAMERATE).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", framerate):
+        raise ValueError("invalid pgs framerate")
+
+    return {
+        "resolution_mode": resolution_mode,
+        "resolution": resolution,
+        "framerate": framerate,
+    }
+
+
+def _derive_pgs_resolution(video: Path, pgs_options: dict) -> str:
+    if pgs_options["resolution_mode"] == "custom":
+        return pgs_options["resolution"]
+
+    dims = _video_dimensions(video)
+    if dims is None:
+        return PGS_RESOLUTION
+    width, height = dims
+    return f"{width}*{height}"
+
+
+def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, framerate: str | None = None) -> tuple[Path, str, Path]:
     if subtitle_path.suffix.lower() not in {".ass", ".ssa"}:
         raise ValueError("pgs conversion only supports ass/ssa")
 
-    tool = _resolve_ass_to_pgs_command()
+    tool = _resolve_pgs_converter_command()
     if not tool:
-        raise RuntimeError("ass_to_pgs tool not configured")
+        raise RuntimeError("pgs converter not configured")
 
-    font_dir = Path(ASS_TO_PGS_FONT_DIR) if ASS_TO_PGS_FONT_DIR else None
+    font_dir = Path(PGS_FONT_DIR) if PGS_FONT_DIR else None
     if font_dir is None or not font_dir.is_dir():
-        raise RuntimeError("ass_to_pgs font dir not found")
+        raise RuntimeError("pgs font dir not found")
+
+    resolved_resolution = (resolution or PGS_RESOLUTION).strip() or PGS_RESOLUTION
+    resolved_framerate = (framerate or PGS_FRAMERATE).strip() or PGS_FRAMERATE
 
     temp_root = TMP_SUBTITLE_ROOT / "_pgs"
     temp_root.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix="pgs-", dir=temp_root))
-    input_copy = work_dir / subtitle_path.name
-    shutil.copy2(subtitle_path, input_copy)
+    subset_dir = work_dir / "subsetted"
+    output_path = subset_dir / f"{subtitle_path.name}.pgs"
 
     cmd = [
         tool,
-        "subset",
-        str(input_copy),
-        "-f",
-        str(font_dir.resolve()),
         "--enable-pgs-output",
-        "--framerate",
-        ASS_TO_PGS_FRAMERATE,
         "--resolution",
-        ASS_TO_PGS_RESOLUTION,
+        resolved_resolution,
+        "--framerate",
+        resolved_framerate,
+        "subset",
+        str(subtitle_path),
+        "--font-dir",
+        str(font_dir),
+        "--output-dir",
+        str(work_dir),
     ]
 
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
     except subprocess.CalledProcessError as exc:
-        raise RuntimeError(exc.output.decode(errors="ignore") or "ass_to_pgs failed") from exc
+        raise RuntimeError(exc.output.decode(errors="ignore") or "pgs conversion failed") from exc
 
-    sup_files = sorted(work_dir.rglob("*.sup"))
-    if not sup_files:
-        raise RuntimeError("ass_to_pgs did not produce a .sup file")
+    if not output_path.exists():
+        candidates = sorted(work_dir.rglob("*.pgs"))
+        if candidates:
+            output_path = candidates[0]
+        else:
+            raise RuntimeError("pgs converter did not produce a .pgs file")
 
-    return sup_files[0], " ".join(shlex.quote(c) for c in cmd), work_dir
+    return output_path, " ".join(shlex.quote(c) for c in cmd), work_dir
 
 
 def _cleanup_dir(path: Path) -> None:
@@ -316,8 +410,10 @@ def api_probe():
         "subtitles": subtitles,
         "uploaded_subtitles": _list_uploaded_subtitles(target),
         "default_output_dir": _configured_default_output_dir_rel(),
-        "pgs_mode_available": _ass_to_pgs_available(),
-        "pgs_mode_hint": "ASS 转 PGS 需要可用的 Linux 工具和字体目录" if not _ass_to_pgs_available() else "",
+        "pgs_defaults": _pgs_defaults(),
+        "video_dimensions": _video_dimensions(target),
+        "pgs_mode_available": _pgs_converter_available(),
+        "pgs_mode_hint": "需要可用的 PGS 转换器和字体目录" if not _pgs_converter_available() else "",
     })
 
 
@@ -439,7 +535,14 @@ def api_embed():
     out_name = body.get("out_name")
     keep_existing = bool(body.get("keep_existing", True))
     subtitle_mode = (body.get("subtitle_mode") or "text").strip() or "text"
-    use_default_output_dir = bool(body.get("use_default_output_dir", False))
+
+    try:
+        embed_settings = _normalize_embed_settings(body)
+        pgs_options = _validate_pgs_options(embed_settings["pgs_options"])
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    use_default_output_dir = embed_settings["use_default_output_dir"]
 
     if not video_rel or not subs:
         return jsonify(error="video and subtitles required"), 400
@@ -479,12 +582,17 @@ def api_embed():
     conversion_cmds = []
     conversion_workdirs = []
     success = False
+    resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
 
     try:
         for sp, meta in sub_paths:
             if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}:
                 try:
-                    converted_path, conversion_cmd, work_dir = _convert_ass_to_pgs(sp)
+                    converted_path, conversion_cmd, work_dir = _convert_ass_to_pgs(
+                        sp,
+                        resolution=resolved_pgs_resolution,
+                        framerate=pgs_options["framerate"],
+                    )
                 except (RuntimeError, ValueError) as exc:
                     return jsonify(error=str(exc)), 400
                 prepared_subs.append({"path": converted_path, "meta": meta, "codec": "copy"})
@@ -542,6 +650,11 @@ def api_embed():
             "output_dir": output_dir,
             "subtitle_mode": subtitle_mode,
             "used_default_output_dir": use_default_output_dir,
+            "pgs_settings": {
+                "resolution_mode": pgs_options["resolution_mode"],
+                "resolution": resolved_pgs_resolution,
+                "framerate": pgs_options["framerate"],
+            },
             "cmd": "\n".join(conversion_cmds + [" ".join(shlex.quote(c) for c in cmd)]),
         })
     finally:

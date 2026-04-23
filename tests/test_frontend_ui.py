@@ -25,15 +25,31 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn("已生成: ${res.output}", self.html)
         self.assertIn("${res.cmd}", self.html)
 
-    def test_embed_section_has_subtitle_mode_and_default_output_controls(self):
+    def test_embed_section_has_subtitle_mode_default_output_and_pgs_controls(self):
         self.assertIn('id="subtitleMode"', self.html)
         self.assertIn('id="useDefaultOutputDir"', self.html)
+        self.assertIn('id="pgsResolutionMode"', self.html)
+        self.assertIn('id="pgsResolution"', self.html)
+        self.assertIn('id="pgsFramerate"', self.html)
         self.assertIn("probe.default_output_dir", self.html)
         self.assertIn("probe.pgs_mode_available", self.html)
+        self.assertIn("probe.pgs_defaults", self.html)
+        self.assertIn("probe.video_dimensions", self.html)
 
-    def test_embed_request_sends_subtitle_mode_and_output_dir_flag(self):
+    def test_embed_request_sends_subtitle_mode_output_dir_flag_and_pgs_options(self):
         self.assertIn("subtitle_mode: document.getElementById('subtitleMode').value", self.html)
         self.assertIn("use_default_output_dir: document.getElementById('useDefaultOutputDir').checked", self.html)
+        self.assertIn("pgs_options:", self.html)
+        self.assertIn("resolution_mode: document.getElementById('pgsResolutionMode').value", self.html)
+        self.assertIn("resolution: document.getElementById('pgsResolution').value", self.html)
+        self.assertIn("framerate: document.getElementById('pgsFramerate').value", self.html)
+
+    def test_embed_settings_state_updates_with_mode_changes(self):
+        self.assertIn("function updateEmbedSettingsState()", self.html)
+        self.assertIn("pgsSettingsPanel.classList.toggle('hidden', !pgsEnabled)", self.html)
+        self.assertIn("pgsResolution.disabled = !pgsEnabled || pgsResolutionMode.value !== 'custom'", self.html)
+        self.assertIn("document.getElementById('subtitleMode').onchange = updateEmbedSettingsState", self.html)
+        self.assertIn("document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState", self.html)
 
 
 if __name__ == "__main__":

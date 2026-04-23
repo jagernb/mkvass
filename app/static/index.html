@@ -40,6 +40,10 @@
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
   .log { background: #000; color: #7fd; padding: 10px; border-radius: 6px; font-family: monospace;
          font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; }
+  .settings-panel { margin-top: 10px; padding: 10px; border: 1px solid #222; border-radius: 6px; background: #11141b; }
+  .settings-panel h3 { margin: 0 0 8px; font-size: 13px; color: #8ab4ff; }
+  .settings-panel.hidden { display: none; }
+  .hidden { display: none !important; }
   .pill { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #2a2f3a;
           font-size: 11px; margin-right: 4px; }
   .extract-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
@@ -193,6 +197,14 @@ function renderDetail(entry, probe) {
   const defaultOutputDir = probe.default_output_dir || '';
   const pgsModeAvailable = Boolean(probe.pgs_mode_available);
   const pgsModeHint = probe.pgs_mode_hint || 'ASS 转 PGS 需要额外工具支持';
+  const pgsDefaults = probe.pgs_defaults || {};
+  const pgsResolutionMode = pgsDefaults.resolution_mode || 'video';
+  const pgsResolution = pgsDefaults.resolution || '1920*1080';
+  const pgsFramerate = pgsDefaults.framerate || '23.976';
+  const videoDimensions = probe.video_dimensions;
+  const videoDimensionsText = Array.isArray(videoDimensions) && videoDimensions.length === 2
+    ? `${videoDimensions[0]}*${videoDimensions[1]}`
+    : '将自动按视频分辨率推导';
 
   c.innerHTML = `
     <section>
@@ -226,6 +238,23 @@ function renderDetail(entry, probe) {
         <label><input type="checkbox" id="useDefaultOutputDir" ${defaultOutputDir ? '' : 'disabled'}> 使用默认输出路径</label>
         <span class="muted" id="defaultOutputDirHint">默认输出路径：${defaultOutputDir ? escapeHtml(defaultOutputDir) : '未配置'}</span>
       </div>
+      <div class="settings-panel" id="embedSettingsPanel">
+        <h3>封装设置</h3>
+        <div class="row">
+          <span class="muted">当前默认输出目录：${defaultOutputDir ? escapeHtml(defaultOutputDir) : '未配置'}</span>
+        </div>
+        <div class="row" id="pgsSettingsPanel" style="margin-top:8px">
+          <label>PGS 尺寸
+            <select id="pgsResolutionMode">
+              <option value="video" ${pgsResolutionMode === 'video' ? 'selected' : ''}>跟随视频</option>
+              <option value="custom" ${pgsResolutionMode === 'custom' ? 'selected' : ''}>自定义</option>
+            </select>
+          </label>
+          <input type="text" id="pgsResolution" value="${escapeHtml(pgsResolution)}" placeholder="如 1920*1080">
+          <input type="text" id="pgsFramerate" value="${escapeHtml(pgsFramerate)}" placeholder="帧率，如 23.976" style="width:150px">
+          <span class="muted" id="pgsVideoHint">视频尺寸：${escapeHtml(videoDimensionsText)}</span>
+        </div>
+      </div>
       <div class="row" style="margin-top:10px">
         <label>字幕处理
           <select id="subtitleMode">
@@ -246,6 +275,24 @@ function renderDetail(entry, probe) {
   });
   document.getElementById('uploadSubtitleBtn').onclick = () => uploadSubtitle(entry);
   document.getElementById('doEmbed').onclick = () => doEmbed(entry);
+  document.getElementById('subtitleMode').onchange = updateEmbedSettingsState;
+  document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState;
+  updateEmbedSettingsState();
+}
+
+function updateEmbedSettingsState() {
+  const subtitleMode = document.getElementById('subtitleMode');
+  const pgsSettingsPanel = document.getElementById('pgsSettingsPanel');
+  const pgsResolutionMode = document.getElementById('pgsResolutionMode');
+  const pgsResolution = document.getElementById('pgsResolution');
+  const pgsFramerate = document.getElementById('pgsFramerate');
+  if (!subtitleMode || !pgsSettingsPanel || !pgsResolutionMode || !pgsResolution || !pgsFramerate) return;
+
+  const pgsEnabled = subtitleMode.value === 'pgs_auto';
+  pgsSettingsPanel.classList.toggle('hidden', !pgsEnabled);
+  pgsResolutionMode.disabled = !pgsEnabled;
+  pgsFramerate.disabled = !pgsEnabled;
+  pgsResolution.disabled = !pgsEnabled || pgsResolutionMode.value !== 'custom';
 }
 
 async function doExtract(entry, info, btn) {
@@ -327,6 +374,11 @@ async function doEmbed(entry) {
     keep_existing: document.getElementById('keepExisting').checked,
     use_default_output_dir: document.getElementById('useDefaultOutputDir').checked,
     subtitle_mode: document.getElementById('subtitleMode').value,
+    pgs_options: {
+      resolution_mode: document.getElementById('pgsResolutionMode').value,
+      resolution: document.getElementById('pgsResolution').value,
+      framerate: document.getElementById('pgsFramerate').value,
+    },
     out_name: document.getElementById('outName').value || null,
   };
   log.textContent = '封装中（可能较慢，请勿关闭页面）...';
@@ -338,7 +390,7 @@ async function doEmbed(entry) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}\n\n${res.cmd}`;
+    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}${res.pgs_settings ? `\nPGS 尺寸: ${res.pgs_settings.resolution}\nPGS 帧率: ${res.pgs_settings.framerate}` : ''}\n\n${res.cmd}`;
     await loadDir(state.cwd);
   } catch (e) {
     log.textContent = '失败: ' + e.message;

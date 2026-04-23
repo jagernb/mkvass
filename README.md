@@ -7,7 +7,7 @@
 - **提取**某条字幕轨道为 `.srt` / `.ass` / `.vtt`（位图字幕导出为 `.sup`，并支持浏览器直接下载）
 - **将同目录下的外挂字幕封装为 `.mkv`**（可多轨、可标记默认、可保留原有字幕）
 - 可配置默认输出路径，并在封装时选择是否使用
-- 浏览器上传的 `.ass/.ssa` 可在封装时选择尝试转换为 PGS 位图字幕（需要额外工具支持）
+- 浏览器上传的 `.ass/.ssa` 可在封装时转换为 PGS 位图字幕后再封装（镜像内已内置 Linux 可用转换器）
 
 ## 目录结构
 
@@ -60,10 +60,10 @@ services:
       - MEDIA_DIR=/media
       - PORT=8080
       - DEFAULT_OUTPUT_DIR=output
-      - ASS_TO_PGS_CMD=
-      - ASS_TO_PGS_FONT_DIR=/app/ass_to_pgs/font
-      - ASS_TO_PGS_FRAMERATE=23.976
-      - ASS_TO_PGS_RESOLUTION=1080p
+      - PGS_CONVERTER_CMD=mkvtool
+      - PGS_FONT_DIR=/usr/share/fonts/truetype/dejavu
+      - PGS_FRAMERATE=23.976
+      - PGS_RESOLUTION=1920*1080
     restart: unless-stopped
 ```
 
@@ -171,9 +171,17 @@ docker compose up -d
 
 - **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`，操作完成后可直接在对应字幕轨的“提取”按钮下方点击下载。
 - **封装**：默认输出 `<原名>.muxed.mkv`。如果配置了 `DEFAULT_OUTPUT_DIR`，则浏览器封装时可勾选“使用默认输出路径”，把结果统一输出到该目录；未勾选时仍输出到原视频同目录。文本字幕模式下外挂字幕会转为 `srt` 写入 MKV。
-- **ASS 转 PGS**：浏览器封装区可选择“ASS 转 PGS 后封装”。该模式仅对 `.ass/.ssa` 生效，并依赖额外的 `ass_to_pgs` 工具与字体目录；当前上游仓库公开内容只提供 macOS / Windows 二进制，因此 Docker/Linux 环境下需要你自行提供可执行文件路径到 `ASS_TO_PGS_CMD`，否则前端会禁用或后端会明确报错。
+- **封装设置区**：视频详情里的“封装设置”会集中显示默认输出目录与 PGS 参数。默认输出目录仅提供“是否使用默认目录”的开关，不支持在页面里临时改成任意别的目录。
+- **ASS 转 PGS**：浏览器封装区可选择“ASS 转 PGS 后封装”。该模式仅对 `.ass/.ssa` 生效。Docker 镜像内默认内置 Linux 可用的 `mkvtool` 转换器，因此正常启动后前端选项会直接可用；如果你自行覆盖相关环境变量，也可以改成别的兼容转换器。
+- **PGS 尺寸与帧率**：前端默认会以“跟随视频”模式自动读取当前视频分辨率，也可以切换为自定义尺寸；帧率也可按这次封装单独填写。未填写请求级值时，后端会回退到环境变量默认配置。
+- **PGS 配置项**：
+  - `PGS_CONVERTER_CMD`：PGS 转换器命令，默认 `mkvtool`
+  - `PGS_FONT_DIR`：字体目录，默认 `/usr/share/fonts/truetype/dejavu`
+  - `PGS_FRAMERATE`：PGS 帧率，默认 `23.976`
+  - `PGS_RESOLUTION`：PGS 分辨率，默认 `1920*1080`
+  - 为兼容旧配置，后端仍接受 `ASS_TO_PGS_CMD`、`ASS_TO_PGS_FONT_DIR`、`ASS_TO_PGS_FRAMERATE`、`ASS_TO_PGS_RESOLUTION`
 - **临时上传字幕**：浏览器上传的 `.srt/.ass/.ssa/.vtt/.sub` 会保存到按视频文件名隔离的隐藏临时目录，只在当前视频详情中显示；封装成功后会清理本次参与封装的临时字幕，封装失败时会保留以便重试。
-- 所有 ffmpeg / ffprobe 命令都会在操作结果中展示，方便你了解实际调用。
+- 所有 ffmpeg / ffprobe / 转换器命令都会在操作结果中展示，方便你了解实际调用。
 - API 只允许访问 `/media` 目录内的文件，防止路径穿越。
 
 ## 常用 API
@@ -183,4 +191,4 @@ docker compose up -d
 - `GET /api/download?path=<字幕路径>` 下载提取出的字幕文件
 - `POST /api/extract` body: `{path, stream_index, codec}`
 - `POST /api/upload-subtitle` form-data: `video=<视频路径>`, `file=<字幕文件>`
-- `POST /api/embed` body: `{video, subtitles:[{path,language,title,default}], keep_existing, out_name, subtitle_mode, use_default_output_dir}`
+- `POST /api/embed` body: `{video, subtitles:[{path,language,title,default}], keep_existing, out_name, subtitle_mode, use_default_output_dir, pgs_options}`
