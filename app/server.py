@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -20,6 +22,11 @@ from werkzeug.utils import secure_filename
 MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "/media")).resolve()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
+DEFAULT_OUTPUT_DIR = (os.environ.get("DEFAULT_OUTPUT_DIR") or "").strip()
+ASS_TO_PGS_CMD = (os.environ.get("ASS_TO_PGS_CMD") or "").strip()
+ASS_TO_PGS_FONT_DIR = (os.environ.get("ASS_TO_PGS_FONT_DIR") or "/app/ass_to_pgs/font").strip()
+ASS_TO_PGS_FRAMERATE = (os.environ.get("ASS_TO_PGS_FRAMERATE") or "23.976").strip() or "23.976"
+ASS_TO_PGS_RESOLUTION = (os.environ.get("ASS_TO_PGS_RESOLUTION") or "1080p").strip() or "1080p"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v", ".flv", ".wmv"}
 SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
@@ -30,7 +37,6 @@ app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 
 def safe_path(rel: str) -> Path:
-    """把相对路径解析到 MEDIA_DIR 下，禁止越权访问。"""
     rel = (rel or "").lstrip("/\\")
     target = (MEDIA_DIR / rel).resolve()
     if MEDIA_DIR != target and MEDIA_DIR not in target.parents:
@@ -95,6 +101,115 @@ def _unique_file_path(parent: Path, filename: str) -> Path:
         if not candidate.exists():
             return candidate
         index += 1
+
+
+def _resolve_ass_to_pgs_command() -> str | None:
+    if not ASS_TO_PGS_CMD:
+        return None
+    candidate = Path(ASS_TO_PGS_CMD)
+    if candidate.is_file():
+        return str(candidate.resolve())
+    return shutil.which(ASS_TO_PGS_CMD)
+
+
+def _ass_to_pgs_available() -> bool:
+    tool = _resolve_ass_to_pgs_command()
+    font_dir = Path(ASS_TO_PGS_FONT_DIR) if ASS_TO_PGS_FONT_DIR else None
+    return bool(tool and font_dir and font_dir.is_dir())
+
+
+def _configured_default_output_dir() -> Path | None:
+    if not DEFAULT_OUTPUT_DIR:
+        return None
+    if Path(DEFAULT_OUTPUT_DIR).is_absolute():
+        raise ValueError("invalid default output dir")
+    target = safe_path(DEFAULT_OUTPUT_DIR)
+    if target.exists() and not target.is_dir():
+        raise ValueError("invalid default output dir")
+    return target
+
+
+def _configured_default_output_dir_rel() -> str | None:
+    try:
+        target = _configured_default_output_dir()
+    except ValueError:
+        return None
+    return rel_to_media(target) if target is not None else None
+
+
+def _resolve_embed_output_path(video: Path, out_name: str | None, use_default_output_dir: bool) -> Path:
+    out_name = _validate_output_name(out_name, f"{video.stem}.muxed.mkv")
+    if not out_name.lower().endswith(".mkv"):
+        out_name += ".mkv"
+
+    base_dir = video.parent
+    if use_default_output_dir:
+        default_dir = _configured_default_output_dir()
+        if default_dir is None:
+            raise ValueError("default output dir not configured")
+        default_dir.mkdir(parents=True, exist_ok=True)
+        base_dir = default_dir
+
+    out_path = (base_dir / out_name).resolve()
+    if MEDIA_DIR not in out_path.parents and out_path != MEDIA_DIR:
+        raise ValueError("output path invalid")
+    return out_path
+
+
+def _count_subtitle_streams(video: Path) -> int:
+    probe = subprocess.check_output([
+        "ffprobe", "-v", "error", "-select_streams", "s",
+        "-show_entries", "stream=index", "-of", "json", str(video),
+    ], timeout=60)
+    return len(json.loads(probe.decode()).get("streams", []))
+
+
+def _convert_ass_to_pgs(subtitle_path: Path) -> tuple[Path, str, Path]:
+    if subtitle_path.suffix.lower() not in {".ass", ".ssa"}:
+        raise ValueError("pgs conversion only supports ass/ssa")
+
+    tool = _resolve_ass_to_pgs_command()
+    if not tool:
+        raise RuntimeError("ass_to_pgs tool not configured")
+
+    font_dir = Path(ASS_TO_PGS_FONT_DIR) if ASS_TO_PGS_FONT_DIR else None
+    if font_dir is None or not font_dir.is_dir():
+        raise RuntimeError("ass_to_pgs font dir not found")
+
+    temp_root = TMP_SUBTITLE_ROOT / "_pgs"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="pgs-", dir=temp_root))
+    input_copy = work_dir / subtitle_path.name
+    shutil.copy2(subtitle_path, input_copy)
+
+    cmd = [
+        tool,
+        "subset",
+        str(input_copy),
+        "-f",
+        str(font_dir.resolve()),
+        "--enable-pgs-output",
+        "--framerate",
+        ASS_TO_PGS_FRAMERATE,
+        "--resolution",
+        ASS_TO_PGS_RESOLUTION,
+    ]
+
+    try:
+        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(exc.output.decode(errors="ignore") or "ass_to_pgs failed") from exc
+
+    sup_files = sorted(work_dir.rglob("*.sup"))
+    if not sup_files:
+        raise RuntimeError("ass_to_pgs did not produce a .sup file")
+
+    return sup_files[0], " ".join(shlex.quote(c) for c in cmd), work_dir
+
+
+def _cleanup_dir(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
 
 
 @app.route("/")
@@ -200,6 +315,9 @@ def api_probe():
         "streams": streams,
         "subtitles": subtitles,
         "uploaded_subtitles": _list_uploaded_subtitles(target),
+        "default_output_dir": _configured_default_output_dir_rel(),
+        "pgs_mode_available": _ass_to_pgs_available(),
+        "pgs_mode_hint": "ASS 转 PGS 需要可用的 Linux 工具和字体目录" if not _ass_to_pgs_available() else "",
     })
 
 
@@ -247,7 +365,6 @@ def api_extract():
     if MEDIA_DIR not in out_path.parents and out_path != MEDIA_DIR:
         return jsonify(error="output path invalid"), 400
 
-    # 对于位图字幕（pgs/dvd/dvb）只能复制，不能转文本
     bitmap = (codec or "").lower() in {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -316,15 +433,18 @@ def api_upload_subtitle():
 
 @app.route("/api/embed", methods=["POST"])
 def api_embed():
-    """把一个或多个外挂字幕以软字幕形式封装进视频（输出 .mkv）。"""
     body = request.get_json(silent=True) or {}
     video_rel = body.get("video")
-    subs = body.get("subtitles") or []  # [{path, language, title, default}]
+    subs = body.get("subtitles") or []
     out_name = body.get("out_name")
     keep_existing = bool(body.get("keep_existing", True))
+    subtitle_mode = (body.get("subtitle_mode") or "text").strip() or "text"
+    use_default_output_dir = bool(body.get("use_default_output_dir", False))
 
     if not video_rel or not subs:
         return jsonify(error="video and subtitles required"), 400
+    if subtitle_mode not in {"text", "pgs_auto"}:
+        return jsonify(error="invalid subtitle mode"), 400
 
     try:
         video = safe_path(video_rel)
@@ -351,74 +471,89 @@ def api_embed():
         sub_paths.append((sp, s))
 
     try:
-        out_name = _validate_output_name(out_name, f"{video.stem}.muxed.mkv")
-    except ValueError:
-        return jsonify(error="invalid output name"), 400
-    if not out_name.lower().endswith(".mkv"):
-        out_name += ".mkv"
-    out_path = (video.parent / out_name).resolve()
-    if MEDIA_DIR not in out_path.parents and out_path != MEDIA_DIR:
-        return jsonify(error="output path invalid"), 400
+        out_path = _resolve_embed_output_path(video, out_name, use_default_output_dir)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
 
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
-    for sp, _ in sub_paths:
-        cmd += ["-i", str(sp)]
-
-    # 映射视频/音频
-    cmd += ["-map", "0:v?", "-map", "0:a?"]
-    # 保留原有字幕
-    if keep_existing:
-        cmd += ["-map", "0:s?"]
-    # 映射外挂字幕
-    for i in range(len(sub_paths)):
-        cmd += ["-map", f"{i + 1}:0"]
-
-    # 复制音视频，字幕重新编码成 mkv 支持的格式
-    cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "srt"]
-
-    # 为每条新加字幕设置元数据
-    base_sub_index = 0  # 相对于输出中字幕流的序号
-    # 如果保留原字幕，需要先统计原字幕数量
-    if keep_existing:
-        try:
-            probe = subprocess.check_output([
-                "ffprobe", "-v", "error", "-select_streams", "s",
-                "-show_entries", "stream=index", "-of", "json", str(video),
-            ], timeout=60)
-            base_sub_index = len(json.loads(probe.decode()).get("streams", []))
-        except Exception:
-            base_sub_index = 0
-
-    for i, (_, meta) in enumerate(sub_paths):
-        out_idx = base_sub_index + i
-        lang = meta.get("language") or "und"
-        title = meta.get("title") or ""
-        cmd += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
-        if title:
-            cmd += [f"-metadata:s:s:{out_idx}", f"title={title}"]
-        if meta.get("default"):
-            cmd += [f"-disposition:s:{out_idx}", "default"]
-
-    cmd.append(str(out_path))
+    prepared_subs = []
+    conversion_cmds = []
+    conversion_workdirs = []
+    success = False
 
     try:
-        subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
-    except subprocess.CalledProcessError as exc:
-        return jsonify(error="ffmpeg failed", cmd=" ".join(shlex.quote(c) for c in cmd),
-                       detail=exc.output.decode(errors="ignore")), 500
+        for sp, meta in sub_paths:
+            if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}:
+                try:
+                    converted_path, conversion_cmd, work_dir = _convert_ass_to_pgs(sp)
+                except (RuntimeError, ValueError) as exc:
+                    return jsonify(error=str(exc)), 400
+                prepared_subs.append({"path": converted_path, "meta": meta, "codec": "copy"})
+                conversion_cmds.append(conversion_cmd)
+                conversion_workdirs.append(work_dir)
+            else:
+                prepared_subs.append({"path": sp, "meta": meta, "codec": "srt"})
 
-    for temp_file in temp_files_to_cleanup:
-        if temp_file.exists():
-            temp_file.unlink()
-    temp_dir = _video_temp_dir(video)
-    if temp_dir.exists() and temp_dir.is_dir() and not any(temp_dir.iterdir()):
-        temp_dir.rmdir()
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
+        for prepared in prepared_subs:
+            cmd += ["-i", str(prepared["path"])]
 
-    return jsonify({
-        "ok": True,
-        "output": rel_to_media(out_path),
-        "cmd": " ".join(shlex.quote(c) for c in cmd),
-    })
+        cmd += ["-map", "0:v?", "-map", "0:a?"]
+        if keep_existing:
+            cmd += ["-map", "0:s?"]
+        for i in range(len(prepared_subs)):
+            cmd += ["-map", f"{i + 1}:0"]
+
+        cmd += ["-c:v", "copy", "-c:a", "copy"]
+
+        base_sub_index = 0
+        if keep_existing:
+            try:
+                base_sub_index = _count_subtitle_streams(video)
+            except Exception:
+                base_sub_index = 0
+            for idx in range(base_sub_index):
+                cmd += [f"-c:s:{idx}", "copy"]
+
+        for i, prepared in enumerate(prepared_subs):
+            out_idx = base_sub_index + i
+            cmd += [f"-c:s:{out_idx}", prepared["codec"]]
+            meta = prepared["meta"]
+            lang = meta.get("language") or "und"
+            title = meta.get("title") or ""
+            cmd += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
+            if title:
+                cmd += [f"-metadata:s:s:{out_idx}", f"title={title}"]
+            if meta.get("default"):
+                cmd += [f"-disposition:s:{out_idx}", "default"]
+
+        cmd.append(str(out_path))
+
+        try:
+            subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
+        except subprocess.CalledProcessError as exc:
+            return jsonify(error="ffmpeg failed", cmd="\n".join(conversion_cmds + [" ".join(shlex.quote(c) for c in cmd)]),
+                           detail=exc.output.decode(errors="ignore")), 500
+
+        success = True
+        output_dir = rel_to_media(out_path.parent) if out_path.parent != MEDIA_DIR else ""
+        return jsonify({
+            "ok": True,
+            "output": rel_to_media(out_path),
+            "output_dir": output_dir,
+            "subtitle_mode": subtitle_mode,
+            "used_default_output_dir": use_default_output_dir,
+            "cmd": "\n".join(conversion_cmds + [" ".join(shlex.quote(c) for c in cmd)]),
+        })
+    finally:
+        for work_dir in conversion_workdirs:
+            _cleanup_dir(work_dir)
+        if success:
+            for temp_file in temp_files_to_cleanup:
+                if temp_file.exists():
+                    temp_file.unlink()
+            temp_dir = _video_temp_dir(video)
+            if temp_dir.exists() and temp_dir.is_dir() and not any(temp_dir.iterdir()):
+                temp_dir.rmdir()
 
 
 if __name__ == "__main__":

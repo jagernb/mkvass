@@ -19,8 +19,19 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.server = server
         self.original_media_dir = server.MEDIA_DIR
         self.original_tmp_root = getattr(server, "TMP_SUBTITLE_ROOT", None)
+        self.original_default_output_dir = getattr(server, "DEFAULT_OUTPUT_DIR", "")
+        self.original_ass_to_pgs_cmd = getattr(server, "ASS_TO_PGS_CMD", "")
+        self.original_ass_to_pgs_font_dir = getattr(server, "ASS_TO_PGS_FONT_DIR", "")
+        self.original_ass_to_pgs_framerate = getattr(server, "ASS_TO_PGS_FRAMERATE", "")
+        self.original_ass_to_pgs_resolution = getattr(server, "ASS_TO_PGS_RESOLUTION", "")
         server.MEDIA_DIR = self.media_dir.resolve()
         server.TMP_SUBTITLE_ROOT = server.MEDIA_DIR / ".tmp_subtitles"
+        server.DEFAULT_OUTPUT_DIR = ""
+        server.ASS_TO_PGS_CMD = ""
+        server.ASS_TO_PGS_FONT_DIR = str(server.MEDIA_DIR / "fonts")
+        server.ASS_TO_PGS_FRAMERATE = "23.976"
+        server.ASS_TO_PGS_RESOLUTION = "1080p"
+        Path(server.ASS_TO_PGS_FONT_DIR).mkdir(parents=True, exist_ok=True)
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
 
@@ -28,6 +39,11 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.server.MEDIA_DIR = self.original_media_dir
         if self.original_tmp_root is not None:
             self.server.TMP_SUBTITLE_ROOT = self.original_tmp_root
+        self.server.DEFAULT_OUTPUT_DIR = self.original_default_output_dir
+        self.server.ASS_TO_PGS_CMD = self.original_ass_to_pgs_cmd
+        self.server.ASS_TO_PGS_FONT_DIR = self.original_ass_to_pgs_font_dir
+        self.server.ASS_TO_PGS_FRAMERATE = self.original_ass_to_pgs_framerate
+        self.server.ASS_TO_PGS_RESOLUTION = self.original_ass_to_pgs_resolution
         self.tempdir.cleanup()
 
     def test_download_returns_attachment_for_extracted_subtitle(self):
@@ -42,11 +58,13 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
         self.assertIn("demo.track2.srt", response.headers.get("Content-Disposition", ""))
 
-    def test_probe_includes_uploaded_subtitles_for_video(self):
+    def test_probe_includes_uploaded_subtitles_and_embed_capabilities(self):
         uploaded_dir = self.media_dir / ".tmp_subtitles" / "movies" / "demo.mkv"
         uploaded_dir.mkdir(parents=True, exist_ok=True)
         uploaded_file = uploaded_dir / "demo-upload.srt"
         uploaded_file.write_text("uploaded", encoding="utf-8")
+        self.server.DEFAULT_OUTPUT_DIR = "output"
+        self.server.ASS_TO_PGS_CMD = "missing-tool"
 
         with patch.object(self.server.subprocess, "check_output", return_value=b'{"streams": [], "format": {}}'):
             response = self.client.get(f"/api/probe?path={self.video_rel}")
@@ -59,6 +77,8 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.assertEqual(uploaded[0]["name"], "demo-upload.srt")
         self.assertEqual(uploaded[0]["role"], "subtitle")
         self.assertEqual(uploaded[0]["path"], ".tmp_subtitles/movies/demo.mkv/demo-upload.srt")
+        self.assertEqual(payload["default_output_dir"], "output")
+        self.assertFalse(payload["pgs_mode_available"])
 
     def test_extract_returns_download_url(self):
         with patch.object(self.server.subprocess, "check_output", return_value=b""):
@@ -133,7 +153,6 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "invalid output name")
 
-
     def test_embed_removes_uploaded_temp_subtitles_after_success(self):
         uploaded_dir = self.media_dir / ".tmp_subtitles" / "movies" / "demo.mkv"
         uploaded_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +183,8 @@ class SubtitleToolServerTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertFalse(uploaded_file.exists())
+
+    def test_embed_rejects_invalid_output_name(self):
         subtitle_rel = "movies/demo.zh.srt"
         subtitle_path = self.media_dir / subtitle_rel
         subtitle_path.write_text("subtitle", encoding="utf-8")
@@ -182,3 +203,77 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.get_json()["error"], "invalid output name")
 
+    def test_embed_uses_default_output_dir_when_enabled(self):
+        subtitle_rel = "movies/demo.zh.srt"
+        subtitle_path = self.media_dir / subtitle_rel
+        subtitle_path.write_text("subtitle", encoding="utf-8")
+        self.server.DEFAULT_OUTPUT_DIR = "output/final"
+
+        captured = {}
+
+        def fake_check_output(cmd, stderr=None, timeout=None):
+            if cmd[:2] == ["ffprobe", "-v"]:
+                return b'{"streams": []}'
+            captured["cmd"] = cmd
+            return b""
+
+        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
+            response = self.client.post(
+                "/api/embed",
+                json={
+                    "video": self.video_rel,
+                    "subtitles": [
+                        {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
+                    ],
+                    "use_default_output_dir": True,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertEqual(payload["output"], "output/final/demo.muxed.mkv")
+        self.assertEqual(payload["output_dir"], "output/final")
+        self.assertTrue(payload["used_default_output_dir"])
+        self.assertEqual(captured["cmd"][-1], str((self.media_dir / "output/final/demo.muxed.mkv").resolve()))
+
+    def test_embed_rejects_default_output_dir_when_not_configured(self):
+        subtitle_rel = "movies/demo.zh.srt"
+        subtitle_path = self.media_dir / subtitle_rel
+        subtitle_path.write_text("subtitle", encoding="utf-8")
+
+        response = self.client.post(
+            "/api/embed",
+            json={
+                "video": self.video_rel,
+                "subtitles": [
+                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
+                ],
+                "use_default_output_dir": True,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "default output dir not configured")
+
+    def test_embed_rejects_pgs_mode_when_tool_not_configured(self):
+        subtitle_rel = "movies/demo.ass"
+        subtitle_path = self.media_dir / subtitle_rel
+        subtitle_path.write_text("ass subtitle", encoding="utf-8")
+
+        response = self.client.post(
+            "/api/embed",
+            json={
+                "video": self.video_rel,
+                "subtitles": [
+                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
+                ],
+                "subtitle_mode": "pgs_auto",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.get_json()["error"], "ass_to_pgs tool not configured")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,8 +5,9 @@
 - 浏览挂载目录，列出视频 / 字幕文件
 - 查看视频的内封字幕轨道（ffprobe）
 - **提取**某条字幕轨道为 `.srt` / `.ass` / `.vtt`（位图字幕导出为 `.sup`，并支持浏览器直接下载）
-- 将同目录下的外挂字幕**封装**为软字幕写入 `.mkv`（可多轨、可标记默认、可保留原有字幕）
-- 在浏览器中上传外挂字幕到临时区，并直接参与当前视频的封装
+- **将同目录下的外挂字幕封装为 `.mkv`**（可多轨、可标记默认、可保留原有字幕）
+- 可配置默认输出路径，并在封装时选择是否使用
+- 浏览器上传的 `.ass/.ssa` 可在封装时选择尝试转换为 PGS 位图字幕（需要额外工具支持）
 
 ## 目录结构
 
@@ -58,6 +59,11 @@ services:
     environment:
       - MEDIA_DIR=/media
       - PORT=8080
+      - DEFAULT_OUTPUT_DIR=output
+      - ASS_TO_PGS_CMD=
+      - ASS_TO_PGS_FONT_DIR=/app/ass_to_pgs/font
+      - ASS_TO_PGS_FRAMERATE=23.976
+      - ASS_TO_PGS_RESOLUTION=1080p
     restart: unless-stopped
 ```
 
@@ -73,6 +79,13 @@ docker compose up -d
 ```bash
 export MKVASS_TAG=1.0.0
 docker compose pull
+docker compose up -d
+```
+
+你也可以设置默认封装输出目录，例如把所有封装结果统一输出到 `/media/output`：
+
+```bash
+export DEFAULT_OUTPUT_DIR=output
 docker compose up -d
 ```
 
@@ -157,7 +170,8 @@ docker compose up -d
 ## 说明
 
 - **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`，操作完成后可直接在对应字幕轨的“提取”按钮下方点击下载。
-- **封装**：默认输出 `<原名>.muxed.mkv`。音视频流直接 copy，不重新编码，速度很快；字幕统一转为 `srt` 写入 MKV。位图字幕（PGS/DVD/DVB）在 MKV 中同样支持但只能 copy，此工具的封装流程默认转为 srt，如需保留位图请在封装前手动处理。
+- **封装**：默认输出 `<原名>.muxed.mkv`。如果配置了 `DEFAULT_OUTPUT_DIR`，则浏览器封装时可勾选“使用默认输出路径”，把结果统一输出到该目录；未勾选时仍输出到原视频同目录。文本字幕模式下外挂字幕会转为 `srt` 写入 MKV。
+- **ASS 转 PGS**：浏览器封装区可选择“ASS 转 PGS 后封装”。该模式仅对 `.ass/.ssa` 生效，并依赖额外的 `ass_to_pgs` 工具与字体目录；当前上游仓库公开内容只提供 macOS / Windows 二进制，因此 Docker/Linux 环境下需要你自行提供可执行文件路径到 `ASS_TO_PGS_CMD`，否则前端会禁用或后端会明确报错。
 - **临时上传字幕**：浏览器上传的 `.srt/.ass/.ssa/.vtt/.sub` 会保存到按视频文件名隔离的隐藏临时目录，只在当前视频详情中显示；封装成功后会清理本次参与封装的临时字幕，封装失败时会保留以便重试。
 - 所有 ffmpeg / ffprobe 命令都会在操作结果中展示，方便你了解实际调用。
 - API 只允许访问 `/media` 目录内的文件，防止路径穿越。
@@ -169,4 +183,4 @@ docker compose up -d
 - `GET /api/download?path=<字幕路径>` 下载提取出的字幕文件
 - `POST /api/extract` body: `{path, stream_index, codec}`
 - `POST /api/upload-subtitle` form-data: `video=<视频路径>`, `file=<字幕文件>`
-- `POST /api/embed` body: `{video, subtitles:[{path,language,title,default}], keep_existing, out_name}`
+- `POST /api/embed` body: `{video, subtitles:[{path,language,title,default}], keep_existing, out_name, subtitle_mode, use_default_output_dir}`

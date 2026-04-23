@@ -10,4 +10,9 @@ services:
     environment:
       - MEDIA_DIR=/media
       - PORT=8080
+      - DEFAULT_OUTPUT_DIR=output
+      - ASS_TO_PGS_CMD=
+      - ASS_TO_PGS_FONT_DIR=/app/ass_to_pgs/font
+      - ASS_TO_PGS_FRAMERATE=23.976
+      - ASS_TO_PGS_RESOLUTION=1080p
     restart: unless-stopped

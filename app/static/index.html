@@ -190,6 +190,10 @@ function renderDetail(entry, probe) {
   }).join('');
   if (!subOptions) subOptions = '<div class="muted">当前没有可用于封装的字幕文件</div>';
 
+  const defaultOutputDir = probe.default_output_dir || '';
+  const pgsModeAvailable = Boolean(probe.pgs_mode_available);
+  const pgsModeHint = probe.pgs_mode_hint || 'ASS 转 PGS 需要额外工具支持';
+
   c.innerHTML = `
     <section>
       <h2>文件信息</h2>
@@ -219,6 +223,17 @@ function renderDetail(entry, probe) {
       ${subOptions}
       <div class="row" style="margin-top:10px">
         <label><input type="checkbox" id="keepExisting" checked> 保留原有内封字幕</label>
+        <label><input type="checkbox" id="useDefaultOutputDir" ${defaultOutputDir ? '' : 'disabled'}> 使用默认输出路径</label>
+        <span class="muted" id="defaultOutputDirHint">默认输出路径：${defaultOutputDir ? escapeHtml(defaultOutputDir) : '未配置'}</span>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label>字幕处理
+          <select id="subtitleMode">
+            <option value="text">文本字幕（默认）</option>
+            <option value="pgs_auto" ${pgsModeAvailable ? '' : 'disabled'}>ASS 转 PGS 后封装</option>
+          </select>
+        </label>
+        <span class="muted">${escapeHtml(pgsModeAvailable ? '已检测到 PGS 转换工具' : pgsModeHint)}</span>
         <input type="text" id="outName" placeholder="输出文件名（默认 *.muxed.mkv）" style="flex:1;min-width:260px">
         <button id="doEmbed">封装</button>
       </div>
@@ -310,6 +325,8 @@ async function doEmbed(entry) {
     video: entry.path,
     subtitles: subs,
     keep_existing: document.getElementById('keepExisting').checked,
+    use_default_output_dir: document.getElementById('useDefaultOutputDir').checked,
+    subtitle_mode: document.getElementById('subtitleMode').value,
     out_name: document.getElementById('outName').value || null,
   };
   log.textContent = '封装中（可能较慢，请勿关闭页面）...';
@@ -321,7 +338,7 @@ async function doEmbed(entry) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    log.textContent = '已生成: ' + res.output + '\n\n' + res.cmd;
+    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}\n\n${res.cmd}`;
     await loadDir(state.cwd);
   } catch (e) {
     log.textContent = '失败: ' + e.message;

@@ -25,6 +25,16 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn("已生成: ${res.output}", self.html)
         self.assertIn("${res.cmd}", self.html)
 
+    def test_embed_section_has_subtitle_mode_and_default_output_controls(self):
+        self.assertIn('id="subtitleMode"', self.html)
+        self.assertIn('id="useDefaultOutputDir"', self.html)
+        self.assertIn("probe.default_output_dir", self.html)
+        self.assertIn("probe.pgs_mode_available", self.html)
+
+    def test_embed_request_sends_subtitle_mode_and_output_dir_flag(self):
+        self.assertIn("subtitle_mode: document.getElementById('subtitleMode').value", self.html)
+        self.assertIn("use_default_output_dir: document.getElementById('useDefaultOutputDir').checked", self.html)
+
 
 if __name__ == "__main__":
     unittest.main()
