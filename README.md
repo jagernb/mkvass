@@ -21,9 +21,77 @@
 └── media/                 # 默认挂载目录（放视频/字幕）
 ```
 
-## 启动
+## 安装与启动
+
+### 使用 Docker 镜像安装
+
+Docker Hub 镜像地址：
+
+```text
+jagernb/mkvass:latest
+```
+
+1. 准备一个宿主机目录用于存放视频和字幕，例如：
+
+```bash
+mkdir -p /opt/mkvass/media
+cd /opt/mkvass
+```
+
+1. 如果镜像仓库是私有的，先登录 Docker Hub：
+
+```bash
+docker login
+```
+
+1. 创建 `docker-compose.yml`：
+
+```yaml
+services:
+  subtitle-tool:
+    image: jagernb/mkvass:${MKVASS_TAG:-latest}
+    container_name: subtitle-tool
+    ports:
+      - "8083:8080"
+    volumes:
+      - /opt/mkvass/media:/media
+    environment:
+      - MEDIA_DIR=/media
+      - PORT=8080
+    restart: unless-stopped
+```
+
+1. 拉取镜像并启动：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+默认会使用 `latest`。如果你想锁定正式版本，可在启动前设置环境变量，例如：
+
+```bash
+export MKVASS_TAG=1.0.0
+docker compose pull
+docker compose up -d
+```
+
+1. 浏览器访问：
+
+```text
+http://localhost:8083
+```
+
+后续更新时重复执行：
+
+```bash
+docker compose pull
+docker compose up -d
+```
 
 ### 本地构建启动
+
+如果你想基于当前仓库源码本地构建，也可以使用：
 
 ```bash
 # 1. 在项目目录下准备 media/ 并放入你的视频文件
@@ -35,34 +103,6 @@ docker compose up -d
 
 # 3. 浏览器访问
 http://localhost:8083
-```
-
-### 使用 Docker Hub 镜像部署
-
-推送到 GitHub 的 `main` 分支后，GitHub Actions 会自动构建并发布镜像到：
-
-```text
-jagernb/mkvass:latest
-```
-
-如果镜像仓库是私有的，先在部署机器登录 Docker Hub：
-
-```bash
-docker login
-```
-
-然后直接拉取并启动：
-
-```bash
-docker compose pull
-docker compose up -d
-```
-
-后续更新时重复执行：
-
-```bash
-docker compose pull
-docker compose up -d
 ```
 
 ## 修改挂载目录
@@ -79,8 +119,10 @@ volumes:
 仓库新增了 GitHub Actions 工作流 [docker-image.yml](.github/workflows/docker-image.yml)：
 
 - push 到 `main` 时自动构建镜像
+- push `v*` Git tag（例如 `v1.0.0`）时自动发布正式版本标签
 - 自动推送到 Docker Hub
-- 默认发布 `latest`、分支名和 commit sha 标签
+- 默认发布 `latest`、分支名、commit sha 标签
+- Git tag 发布时额外生成 `1.0.0`、`1.0` 这类版本标签
 
 首次启用时请确认：
 
@@ -88,9 +130,33 @@ volumes:
 - 在 GitHub 仓库 Secrets 中配置 `DOCKERHUB_TOKEN`
 - 如果部署端要匿名拉取，需要把 Docker Hub 仓库设为 public
 
+### 发布正式版本
+
+当你需要发布一个可固定部署、可回退的正式版本时：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+随后 GitHub Actions 会自动发布这些镜像标签：
+
+- `jagernb/mkvass:1.0.0`
+- `jagernb/mkvass:1.0`
+
+### 回退到旧版本
+
+如果需要回退，只要把部署机上的 `MKVASS_TAG` 改成旧版本号，再重新拉取并启动：
+
+```bash
+export MKVASS_TAG=1.0.0
+docker compose pull
+docker compose up -d
+```
+
 ## 说明
 
-- **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`，操作完成后可直接在浏览器点击下载。
+- **提取**：输出文件会保存到原视频同目录，命名为 `<原名>.track<索引>.<扩展>`，操作完成后可直接在对应字幕轨的“提取”按钮下方点击下载。
 - **封装**：默认输出 `<原名>.muxed.mkv`。音视频流直接 copy，不重新编码，速度很快；字幕统一转为 `srt` 写入 MKV。位图字幕（PGS/DVD/DVB）在 MKV 中同样支持但只能 copy，此工具的封装流程默认转为 srt，如需保留位图请在封装前手动处理。
 - **临时上传字幕**：浏览器上传的 `.srt/.ass/.ssa/.vtt/.sub` 会保存到按视频文件名隔离的隐藏临时目录，只在当前视频详情中显示；封装成功后会清理本次参与封装的临时字幕，封装失败时会保留以便重试。
 - 所有 ffmpeg / ffprobe 命令都会在操作结果中展示，方便你了解实际调用。

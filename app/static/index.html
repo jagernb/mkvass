@@ -42,7 +42,10 @@
          font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 260px; overflow: auto; }
   .pill { display: inline-block; padding: 2px 6px; border-radius: 4px; background: #2a2f3a;
           font-size: 11px; margin-right: 4px; }
-  .link-btn { color: #8ab4ff; text-decoration: none; font-size: 13px; }
+  .extract-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
+  .extract-download-slot:empty { display: none; }
+  .download-btn { display: inline-block; background: #00b376; color: #fff; text-decoration: none;
+                  padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; }
   .tag.temp { background: #7c4dff33; color: #c9b3ff; }
 </style>
 </head>
@@ -166,7 +169,10 @@ function renderDetail(entry, probe) {
       <td>${s.language || ''}</td>
       <td>${s.title || ''}</td>
       <td>
-        <button data-extract='${JSON.stringify({stream_index:s.index, codec:s.codec})}'>提取</button>
+        <div class="extract-actions">
+          <button data-extract='${JSON.stringify({stream_index:s.index, codec:s.codec})}'>提取</button>
+          <div class="extract-download-slot" data-download-slot="${s.index}"></div>
+        </div>
       </td>
     </tr>`).join('') : '<tr><td colspan="5" class="muted">没有内封字幕轨道</td></tr>';
 
@@ -229,8 +235,10 @@ function renderDetail(entry, probe) {
 
 async function doExtract(entry, info, btn) {
   const log = document.getElementById('extractLog');
+  const slot = btn.parentElement.querySelector('[data-download-slot]');
   log.style.display = '';
   log.textContent = '提取中...';
+  if (slot) slot.innerHTML = '';
   btn.disabled = true;
   try {
     const res = await api('/api/extract', {
@@ -238,8 +246,10 @@ async function doExtract(entry, info, btn) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ path: entry.path, stream_index: info.stream_index, codec: info.codec }),
     });
-    log.innerHTML = `已生成: ${escapeHtml(res.output)}\n<a class="link-btn" href="${escapeHtml(res.download_url)}">下载字幕</a>\n\n${escapeHtml(res.cmd)}`;
-    await loadDir(state.cwd);
+    log.textContent = `已生成: ${res.output}\n\n${res.cmd}`;
+    if (slot && res.download_url) {
+      slot.innerHTML = `<a class="download-btn" href="${escapeHtml(res.download_url)}">下载字幕</a>`;
+    }
   } catch (e) {
     log.textContent = '失败: ' + e.message;
   } finally {
