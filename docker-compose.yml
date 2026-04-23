@@ -1,7 +1,6 @@
 services:
   subtitle-tool:
-    build: .
-    image: subtitle-tool:latest
+    image: ghcr.io/jagernb/mkvass:latest
     container_name: subtitle-tool
     ports:
       - "8083:8080"

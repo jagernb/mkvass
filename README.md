@@ -23,15 +23,46 @@
 
 ## 启动
 
+### 本地构建启动
+
 ```bash
 # 1. 在项目目录下准备 media/ 并放入你的视频文件
 mkdir -p media
 
-# 2. 构建并启动
-docker compose up -d --build
+# 2. 本地构建镜像并启动
+docker build -t ghcr.io/jagernb/mkvass:latest .
+docker compose up -d
 
 # 3. 浏览器访问
 http://localhost:8083
+```
+
+### 使用 GHCR 镜像部署
+
+推送到 GitHub 的 `main` 分支后，GitHub Actions 会自动构建并发布镜像到：
+
+```text
+ghcr.io/jagernb/mkvass:latest
+```
+
+如果镜像仍是私有的，先在部署机器登录 GHCR：
+
+```bash
+docker login ghcr.io
+```
+
+然后直接拉取并启动：
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+后续更新时重复执行：
+
+```bash
+docker compose pull
+docker compose up -d
 ```
 
 ## 修改挂载目录
@@ -42,6 +73,19 @@ http://localhost:8083
 volumes:
   - /your/real/path:/media
 ```
+
+## 自动发布镜像
+
+仓库新增了 GitHub Actions 工作流 [docker-image.yml](.github/workflows/docker-image.yml)：
+
+- push 到 `main` 时自动构建镜像
+- 自动推送到 GHCR
+- 默认发布 `latest`、分支名和 commit sha 标签
+
+首次启用时请确认：
+
+- GitHub Actions 对 Packages 具有写权限
+- 如果部署端要匿名拉取，需要把 GHCR 包改为 public
 
 ## 说明
 
