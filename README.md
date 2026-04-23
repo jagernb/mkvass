@@ -30,25 +30,25 @@
 mkdir -p media
 
 # 2. 本地构建镜像并启动
-docker build -t ghcr.io/jagernb/mkvass:latest .
+docker build -t jagernb/mkvass:latest .
 docker compose up -d
 
 # 3. 浏览器访问
 http://localhost:8083
 ```
 
-### 使用 GHCR 镜像部署
+### 使用 Docker Hub 镜像部署
 
 推送到 GitHub 的 `main` 分支后，GitHub Actions 会自动构建并发布镜像到：
 
 ```text
-ghcr.io/jagernb/mkvass:latest
+jagernb/mkvass:latest
 ```
 
-如果镜像仍是私有的，先在部署机器登录 GHCR：
+如果镜像仓库是私有的，先在部署机器登录 Docker Hub：
 
 ```bash
-docker login ghcr.io
+docker login
 ```
 
 然后直接拉取并启动：
@@ -79,13 +79,14 @@ volumes:
 仓库新增了 GitHub Actions 工作流 [docker-image.yml](.github/workflows/docker-image.yml)：
 
 - push 到 `main` 时自动构建镜像
-- 自动推送到 GHCR
+- 自动推送到 Docker Hub
 - 默认发布 `latest`、分支名和 commit sha 标签
 
 首次启用时请确认：
 
-- GitHub Actions 对 Packages 具有写权限
-- 如果部署端要匿名拉取，需要把 GHCR 包改为 public
+- 在 GitHub 仓库 Secrets 中配置 `DOCKERHUB_USERNAME`
+- 在 GitHub 仓库 Secrets 中配置 `DOCKERHUB_TOKEN`
+- 如果部署端要匿名拉取，需要把 Docker Hub 仓库设为 public
 
 ## 说明
 
