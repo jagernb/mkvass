@@ -12,6 +12,7 @@ services:
       - PORT=8080
       - DEFAULT_OUTPUT_DIR=output
       - PGS_CONVERTER_CMD=mkvtool
+      - MKVMERGE_CMD=mkvmerge
       - PGS_FONT_DIR=/usr/share/fonts/truetype/dejavu
       - PGS_FRAMERATE=23.976
       - PGS_RESOLUTION=1920*1080

@@ -23,8 +23,11 @@ from werkzeug.utils import secure_filename
 MEDIA_DIR = Path(os.environ.get("MEDIA_DIR", "/media")).resolve()
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
+APP_VERSION = (os.environ.get("APP_VERSION") or "dev").strip() or "dev"
+BUILD_DATE = (os.environ.get("BUILD_DATE") or "").strip()
 DEFAULT_OUTPUT_DIR = (os.environ.get("DEFAULT_OUTPUT_DIR") or "").strip()
 PGS_CONVERTER_CMD = (os.environ.get("PGS_CONVERTER_CMD") or os.environ.get("ASS_TO_PGS_CMD") or "mkvtool").strip()
+MKVMERGE_CMD = (os.environ.get("MKVMERGE_CMD") or "mkvmerge").strip()
 PGS_FONT_DIR = (os.environ.get("PGS_FONT_DIR") or os.environ.get("ASS_TO_PGS_FONT_DIR") or "/usr/share/fonts/truetype/dejavu").strip()
 PGS_FRAMERATE = (os.environ.get("PGS_FRAMERATE") or os.environ.get("ASS_TO_PGS_FRAMERATE") or "23.976").strip() or "23.976"
 PGS_RESOLUTION = (os.environ.get("PGS_RESOLUTION") or os.environ.get("ASS_TO_PGS_RESOLUTION") or "1920*1080").strip() or "1920*1080"
@@ -115,6 +118,15 @@ def _resolve_pgs_converter_command() -> str | None:
     return shutil.which(PGS_CONVERTER_CMD)
 
 
+def _resolve_mkvmerge_command() -> str | None:
+    if not MKVMERGE_CMD:
+        return None
+    candidate = Path(MKVMERGE_CMD)
+    if candidate.is_file():
+        return str(candidate.resolve())
+    return shutil.which(MKVMERGE_CMD)
+
+
 def _pgs_converter_status() -> dict:
     tool = _resolve_pgs_converter_command()
     font_dir = Path(PGS_FONT_DIR) if PGS_FONT_DIR else None
@@ -185,6 +197,38 @@ def _count_subtitle_streams(video: Path) -> int:
         "-show_entries", "stream=index", "-of", "json", str(video),
     ], timeout=60)
     return len(json.loads(probe.decode()).get("streams", []))
+
+
+def _parse_frame_rate(raw: str | None, source: str) -> dict | None:
+    raw = (raw or "").strip()
+    if not raw or raw == "0/0":
+        return None
+    if "/" in raw:
+        numerator, denominator = raw.split("/", 1)
+        try:
+            value = float(numerator) / float(denominator)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+    else:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+    if value <= 0:
+        return None
+    display_value = f"{value:.3f}".rstrip("0").rstrip(".")
+    return {"raw": raw, "value": value, "display": f"{display_value} fps", "source": source}
+
+
+def _video_framerate(streams: list[dict]) -> dict | None:
+    for stream in streams:
+        if stream.get("codec_type") != "video":
+            continue
+        return (
+            _parse_frame_rate(stream.get("avg_frame_rate"), "avg_frame_rate")
+            or _parse_frame_rate(stream.get("r_frame_rate"), "r_frame_rate")
+        )
+    return None
 
 
 def _video_dimensions(video: Path) -> tuple[int, int] | None:
@@ -344,6 +388,73 @@ def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, f
     return output_path, " ".join(shlex.quote(c) for c in cmd), work_dir
 
 
+def _subtitle_warning_for_existing_pgs(prepared_subs: list[dict]) -> list[str]:
+    if any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs):
+        return ["已有 PGS/SUP 字幕会原样封装；尺寸设置仅用于 ASS/SSA 转 PGS。"]
+    return []
+
+
+def _build_ffmpeg_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool) -> list[str]:
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
+    for prepared in prepared_subs:
+        cmd += ["-i", str(prepared["path"])]
+
+    cmd += ["-map", "0:v?", "-map", "0:a?"]
+    if keep_existing:
+        cmd += ["-map", "0:s?"]
+    for i in range(len(prepared_subs)):
+        cmd += ["-map", f"{i + 1}:0"]
+
+    cmd += ["-c:v", "copy", "-c:a", "copy"]
+
+    base_sub_index = 0
+    if keep_existing:
+        try:
+            base_sub_index = _count_subtitle_streams(video)
+        except Exception:
+            base_sub_index = 0
+        for idx in range(base_sub_index):
+            cmd += [f"-c:s:{idx}", "copy"]
+
+    for i, prepared in enumerate(prepared_subs):
+        out_idx = base_sub_index + i
+        cmd += [f"-c:s:{out_idx}", prepared["codec"]]
+        meta = prepared["meta"]
+        lang = meta.get("language") or "und"
+        title = meta.get("title") or ""
+        cmd += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
+        if title:
+            cmd += [f"-metadata:s:s:{out_idx}", f"title={title}"]
+        if meta.get("default"):
+            cmd += [f"-disposition:s:{out_idx}", "default"]
+
+    cmd.append(str(out_path))
+    return cmd
+
+
+def _build_mkvmerge_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool) -> list[str]:
+    tool = _resolve_mkvmerge_command()
+    if not tool:
+        raise RuntimeError("mkvmerge not found")
+
+    cmd = [tool, "-o", str(out_path)]
+    if not keep_existing:
+        cmd.append("--no-subtitles")
+    cmd.append(str(video))
+
+    for prepared in prepared_subs:
+        meta = prepared["meta"]
+        lang = meta.get("language") or "und"
+        title = meta.get("title") or ""
+        cmd += ["--language", f"0:{lang}"]
+        if title:
+            cmd += ["--track-name", f"0:{title}"]
+        cmd += ["--default-track-flag", f"0:{'yes' if meta.get('default') else 'no'}"]
+        cmd.append(str(prepared["path"]))
+
+    return cmd
+
+
 def _convert_ass_to_pgs_persistent(subtitle_path: Path, *, resolution: str | None = None, framerate: str | None = None) -> tuple[Path, str]:
     output_path, cmd_text, work_dir = _convert_ass_to_pgs(
         subtitle_path,
@@ -385,6 +496,11 @@ def api_download():
         return jsonify(error="unsupported file type"), 400
 
     return send_file(target, as_attachment=True, download_name=target.name)
+
+
+@app.route("/api/version")
+def api_version():
+    return jsonify({"version": APP_VERSION, "build_date": BUILD_DATE})
 
 
 @app.route("/api/list")
@@ -475,6 +591,7 @@ def api_probe():
         "default_output_dir": _configured_default_output_dir_rel(),
         "pgs_defaults": _pgs_defaults(),
         "video_dimensions": _video_dimensions(target),
+        "video_framerate": _video_framerate(streams),
         "pgs_mode_available": pgs_status["available"],
         "pgs_mode_hint": pgs_status["hint"],
         "pgs_mode_missing": pgs_status["missing"],
@@ -705,45 +822,21 @@ def api_embed():
             codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
             prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
 
-        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
-        for prepared in prepared_subs:
-            cmd += ["-i", str(prepared["path"])]
-
-        cmd += ["-map", "0:v?", "-map", "0:a?"]
-        if keep_existing:
-            cmd += ["-map", "0:s?"]
-        for i in range(len(prepared_subs)):
-            cmd += ["-map", f"{i + 1}:0"]
-
-        cmd += ["-c:v", "copy", "-c:a", "copy"]
-
-        base_sub_index = 0
-        if keep_existing:
-            try:
-                base_sub_index = _count_subtitle_streams(video)
-            except Exception:
-                base_sub_index = 0
-            for idx in range(base_sub_index):
-                cmd += [f"-c:s:{idx}", "copy"]
-
-        for i, prepared in enumerate(prepared_subs):
-            out_idx = base_sub_index + i
-            cmd += [f"-c:s:{out_idx}", prepared["codec"]]
-            meta = prepared["meta"]
-            lang = meta.get("language") or "und"
-            title = meta.get("title") or ""
-            cmd += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
-            if title:
-                cmd += [f"-metadata:s:s:{out_idx}", f"title={title}"]
-            if meta.get("default"):
-                cmd += [f"-disposition:s:{out_idx}", "default"]
-
-        cmd.append(str(out_path))
+        has_pgs_subtitle = any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs)
+        muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
+        warnings = _subtitle_warning_for_existing_pgs(prepared_subs)
+        try:
+            if muxer == "mkvmerge":
+                cmd = _build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing)
+            else:
+                cmd = _build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing)
+        except RuntimeError as exc:
+            return jsonify(error=str(exc)), 500
 
         try:
             subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
         except subprocess.CalledProcessError as exc:
-            return jsonify(error="ffmpeg failed", cmd=" ".join(shlex.quote(c) for c in cmd),
+            return jsonify(error=f"{muxer} failed", cmd=" ".join(shlex.quote(c) for c in cmd),
                            detail=exc.output.decode(errors="ignore")), 500
 
         success = True
@@ -754,10 +847,14 @@ def api_embed():
             "output_dir": output_dir,
             "subtitle_mode": subtitle_mode,
             "used_default_output_dir": use_default_output_dir,
+            "muxer": muxer,
+            "warnings": warnings,
             "pgs_settings": {
                 "resolution_mode": pgs_options["resolution_mode"],
                 "resolution": resolved_pgs_resolution,
                 "framerate": pgs_options["framerate"],
+                "applies_to": "ass_to_pgs_conversion_only",
+                "applied_to_existing_pgs": False,
             },
             "cmd": " ".join(shlex.quote(c) for c in cmd),
         })

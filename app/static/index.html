@@ -56,6 +56,7 @@
 <body>
 <header>
   <h1>字幕提取/封装</h1>
+  <span class="muted" id="versionInfo"></span>
   <span class="crumbs" id="crumbs">/</span>
   <span style="margin-left:auto" class="muted">媒体目录挂载在容器 /media</span>
 </header>
@@ -95,6 +96,17 @@ function escapeHtml(value) {
     '"': '&quot;',
     "'": '&#39;'
   }[ch]));
+}
+
+async function loadVersion() {
+  try {
+    const data = await api('/api/version');
+    const versionText = data.version ? `v${data.version}` : '';
+    const buildText = data.build_date || '';
+    document.getElementById('versionInfo').textContent = [versionText, buildText].filter(Boolean).join(' · ');
+  } catch (e) {
+    document.getElementById('versionInfo').textContent = '';
+  }
 }
 
 async function loadDir(path='') {
@@ -207,7 +219,9 @@ function renderDetail(entry, probe) {
   const pgsDefaults = probe.pgs_defaults || {};
   const pgsResolutionMode = pgsDefaults.resolution_mode || 'video';
   const pgsResolution = pgsDefaults.resolution || '1920*1080';
-  const pgsFramerate = pgsDefaults.framerate || '23.976';
+  const videoFramerate = probe.video_framerate || null;
+  const videoFramerateText = videoFramerate?.display || '未探测到';
+  const pgsFramerate = videoFramerate?.raw || pgsDefaults.framerate || '23.976';
   const videoDimensions = probe.video_dimensions;
   const videoDimensionsText = Array.isArray(videoDimensions) && videoDimensions.length === 2
     ? `${videoDimensions[0]}*${videoDimensions[1]}`
@@ -221,6 +235,7 @@ function renderDetail(entry, probe) {
         <span class="pill">${bytes(entry.size)}</span>
         <span class="pill">格式: ${probe.format?.format_name || ''}</span>
         <span class="pill">时长: ${probe.format?.duration ? Number(probe.format.duration).toFixed(1)+'s' : ''}</span>
+        <span class="pill">帧率: ${escapeHtml(videoFramerateText)}</span>
       </div>
     </section>
 
@@ -259,7 +274,8 @@ function renderDetail(entry, probe) {
           </label>
           <input type="text" id="pgsResolution" value="${escapeHtml(pgsResolution)}" placeholder="如 1920*1080">
           <input type="text" id="pgsFramerate" value="${escapeHtml(pgsFramerate)}" placeholder="帧率，如 23.976" style="width:150px">
-          <span class="muted" id="pgsVideoHint">视频尺寸：${escapeHtml(videoDimensionsText)}</span>
+          <span class="muted" id="pgsVideoHint">视频尺寸：${escapeHtml(videoDimensionsText)}；视频帧率：${escapeHtml(videoFramerateText)}</span>
+          <span class="muted" id="pgsExistingHint"></span>
         </div>
       </div>
       <div class="row" style="margin-top:10px">
@@ -297,12 +313,15 @@ function updateEmbedSettingsState() {
   const pgsResolution = document.getElementById('pgsResolution');
   const pgsFramerate = document.getElementById('pgsFramerate');
   const pgsModeHint = document.getElementById('pgsModeHint');
+  const pgsExistingHint = document.getElementById('pgsExistingHint');
   if (!subtitleMode || !pgsSettingsPanel || !pgsResolutionMode || !pgsResolution || !pgsFramerate) return;
 
   const pgsOption = subtitleMode.querySelector('option[value="pgs_auto"]');
   const pgsToolAvailable = subtitleMode.dataset.pgsAvailable === 'true';
   const selectedSubs = [...document.querySelectorAll('.embed-sub:checked')];
   const hasAssSubtitle = selectedSubs.some(cb => ['.ass', '.ssa'].includes(cb.dataset.ext));
+  const hasExistingPgsSubtitle = selectedSubs.some(cb => ['.pgs', '.sup'].includes(cb.dataset.ext));
+  const onlyExistingPgsSubtitle = hasExistingPgsSubtitle && !hasAssSubtitle;
   const pgsSelectable = pgsToolAvailable && hasAssSubtitle;
 
   if (pgsOption) pgsOption.disabled = !pgsSelectable;
@@ -311,15 +330,25 @@ function updateEmbedSettingsState() {
   if (pgsModeHint) {
     if (!pgsToolAvailable) {
       pgsModeHint.textContent = subtitleMode.dataset.pgsHint || '需要可用的 PGS 转换器和字体目录';
+    } else if (onlyExistingPgsSubtitle) {
+      pgsModeHint.textContent = '已有 PGS/SUP 会原样封装；尺寸设置仅用于 ASS/SSA 转 PGS。';
     } else if (!hasAssSubtitle) {
       pgsModeHint.textContent = '请选择至少一个 ASS/SSA 字幕后启用 PGS 转换';
     } else {
-      pgsModeHint.textContent = '已选择 ASS/SSA 字幕，可转换为 PGS 后封装';
+      pgsModeHint.textContent = hasExistingPgsSubtitle
+        ? 'ASS/SSA 会转换为 PGS；已有 PGS/SUP 会原样封装'
+        : '已选择 ASS/SSA 字幕，可转换为 PGS 后封装';
     }
   }
+  if (pgsExistingHint) {
+    pgsExistingHint.textContent = hasExistingPgsSubtitle
+      ? '已有 PGS/SUP 会原样封装；尺寸设置仅用于 ASS/SSA 转 PGS。'
+      : '';
+  }
 
-  const pgsEnabled = subtitleMode.value === 'pgs_auto';
-  pgsSettingsPanel.classList.toggle('hidden', !pgsEnabled);
+  const pgsEnabled = subtitleMode.value === 'pgs_auto' && hasAssSubtitle;
+  const showPgsSettings = pgsEnabled || onlyExistingPgsSubtitle;
+  pgsSettingsPanel.classList.toggle('hidden', !showPgsSettings);
   pgsResolutionMode.disabled = !pgsEnabled;
   pgsFramerate.disabled = !pgsEnabled;
   pgsResolution.disabled = !pgsEnabled || pgsResolutionMode.value !== 'custom';
@@ -448,7 +477,10 @@ async function doEmbed(entry) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}${res.pgs_settings ? `\nPGS 尺寸: ${res.pgs_settings.resolution}\nPGS 帧率: ${res.pgs_settings.framerate}` : ''}\n\n${res.cmd}`;
+    const warningText = Array.isArray(res.warnings) && res.warnings.length
+      ? `\n警告: ${res.warnings.join('；')}`
+      : '';
+    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n封装器: ${res.muxer || 'ffmpeg'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}${res.pgs_settings ? `\nPGS 尺寸: ${res.pgs_settings.resolution}\nPGS 帧率: ${res.pgs_settings.framerate}` : ''}${warningText}\n\n${res.cmd}`;
     await loadDir(state.cwd);
   } catch (e) {
     log.textContent = '失败: ' + e.message;
@@ -458,6 +490,7 @@ async function doEmbed(entry) {
   }
 }
 
+loadVersion();
 loadDir('');
 </script>
 </body>
