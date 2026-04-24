@@ -86,10 +86,39 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.assertEqual(uploaded[0]["path"], ".tmp_subtitles/movies/demo.mkv/demo-upload.srt")
         self.assertEqual(payload["default_output_dir"], "output")
         self.assertFalse(payload["pgs_mode_available"])
+        self.assertIn("converter", payload["pgs_mode_missing"])
+        self.assertIn("未找到 PGS 转换器", payload["pgs_mode_hint"])
         self.assertEqual(payload["pgs_defaults"]["resolution"], "1920*1080")
         self.assertEqual(payload["pgs_defaults"]["framerate"], "23.976")
         self.assertEqual(payload["pgs_defaults"]["resolution_mode"], "video")
         self.assertEqual(payload["video_dimensions"], [1920, 1080])
+
+    def test_probe_reports_missing_pgs_font_dir(self):
+        self.server.PGS_CONVERTER_CMD = "mkvtool"
+        self.server.PGS_FONT_DIR = str(self.media_dir / "missing-fonts")
+
+        with patch.object(self.server.subprocess, "check_output", return_value=b'{"streams": [], "format": {}}'):
+            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
+                response = self.client.get(f"/api/probe?path={self.video_rel}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload["pgs_mode_available"])
+        self.assertEqual(payload["pgs_mode_missing"], ["font_dir"])
+        self.assertIn("PGS 字体目录不存在", payload["pgs_mode_hint"])
+
+    def test_probe_reports_pgs_available_when_converter_and_font_dir_exist(self):
+        self.server.PGS_CONVERTER_CMD = "mkvtool"
+
+        with patch.object(self.server.subprocess, "check_output", return_value=b'{"streams": [], "format": {}}'):
+            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
+                response = self.client.get(f"/api/probe?path={self.video_rel}")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload["pgs_mode_available"])
+        self.assertEqual(payload["pgs_mode_hint"], "")
+        self.assertEqual(payload["pgs_mode_missing"], [])
 
     def test_extract_returns_download_url(self):
         with patch.object(self.server.subprocess, "check_output", return_value=b""):

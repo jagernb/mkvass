@@ -158,6 +158,12 @@ async function showVideo(entry) {
   renderDetail(entry, probe);
 }
 
+function subtitleExt(path) {
+  const name = String(path || '').split(/[\\/]/).pop();
+  const index = name.lastIndexOf('.');
+  return index >= 0 ? name.slice(index).toLowerCase() : '';
+}
+
 function renderDetail(entry, probe) {
   const c = document.getElementById('content');
   const subs = probe.subtitles || [];
@@ -183,8 +189,9 @@ function renderDetail(entry, probe) {
   let subOptions = embedCandidates.map(s => {
     const isUpload = s.source === 'upload';
     const sourceTag = isUpload ? '<span class="tag temp">临时</span>' : '<span class="tag subtitle">目录</span>';
+    const ext = subtitleExt(s.name || s.path);
     return `<label style="display:block;padding:4px 0">
-       <input type="checkbox" class="embed-sub" data-path="${escapeHtml(s.path)}">
+       <input type="checkbox" class="embed-sub" data-path="${escapeHtml(s.path)}" data-ext="${escapeHtml(ext)}">
        ${sourceTag}
        ${escapeHtml(s.name)}
        <input type="text" placeholder="语言(如 chi/eng)" class="embed-lang" style="width:100px" value="und">
@@ -257,12 +264,12 @@ function renderDetail(entry, probe) {
       </div>
       <div class="row" style="margin-top:10px">
         <label>字幕处理
-          <select id="subtitleMode">
+          <select id="subtitleMode" data-pgs-available="${pgsModeAvailable ? 'true' : 'false'}" data-pgs-hint="${escapeHtml(pgsModeHint)}">
             <option value="text">文本字幕（默认）</option>
-            <option value="pgs_auto" ${pgsModeAvailable ? '' : 'disabled'}>ASS 转 PGS 后封装</option>
+            <option value="pgs_auto" disabled>ASS 转 PGS 后封装</option>
           </select>
         </label>
-        <span class="muted">${escapeHtml(pgsModeAvailable ? '已检测到 PGS 转换工具' : pgsModeHint)}</span>
+        <span class="muted" id="pgsModeHint"></span>
         <input type="text" id="outName" placeholder="输出文件名（默认 *.muxed.mkv）" style="flex:1;min-width:260px">
         <button id="doEmbed">封装</button>
       </div>
@@ -277,6 +284,9 @@ function renderDetail(entry, probe) {
   document.getElementById('doEmbed').onclick = () => doEmbed(entry);
   document.getElementById('subtitleMode').onchange = updateEmbedSettingsState;
   document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState;
+  c.querySelectorAll('.embed-sub').forEach(cb => {
+    cb.onchange = updateEmbedSettingsState;
+  });
   updateEmbedSettingsState();
 }
 
@@ -286,7 +296,27 @@ function updateEmbedSettingsState() {
   const pgsResolutionMode = document.getElementById('pgsResolutionMode');
   const pgsResolution = document.getElementById('pgsResolution');
   const pgsFramerate = document.getElementById('pgsFramerate');
+  const pgsModeHint = document.getElementById('pgsModeHint');
   if (!subtitleMode || !pgsSettingsPanel || !pgsResolutionMode || !pgsResolution || !pgsFramerate) return;
+
+  const pgsOption = subtitleMode.querySelector('option[value="pgs_auto"]');
+  const pgsToolAvailable = subtitleMode.dataset.pgsAvailable === 'true';
+  const selectedSubs = [...document.querySelectorAll('.embed-sub:checked')];
+  const hasAssSubtitle = selectedSubs.some(cb => ['.ass', '.ssa'].includes(cb.dataset.ext));
+  const pgsSelectable = pgsToolAvailable && hasAssSubtitle;
+
+  if (pgsOption) pgsOption.disabled = !pgsSelectable;
+  if (!pgsSelectable && subtitleMode.value === 'pgs_auto') subtitleMode.value = 'text';
+
+  if (pgsModeHint) {
+    if (!pgsToolAvailable) {
+      pgsModeHint.textContent = subtitleMode.dataset.pgsHint || '需要可用的 PGS 转换器和字体目录';
+    } else if (!hasAssSubtitle) {
+      pgsModeHint.textContent = '请选择至少一个 ASS/SSA 字幕后启用 PGS 转换';
+    } else {
+      pgsModeHint.textContent = '已选择 ASS/SSA 字幕，可转换为 PGS 后封装';
+    }
+  }
 
   const pgsEnabled = subtitleMode.value === 'pgs_auto';
   pgsSettingsPanel.classList.toggle('hidden', !pgsEnabled);

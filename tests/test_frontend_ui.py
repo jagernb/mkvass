@@ -31,8 +31,11 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn('id="pgsResolutionMode"', self.html)
         self.assertIn('id="pgsResolution"', self.html)
         self.assertIn('id="pgsFramerate"', self.html)
+        self.assertIn('id="pgsModeHint"', self.html)
+        self.assertIn('data-ext="${escapeHtml(ext)}"', self.html)
         self.assertIn("probe.default_output_dir", self.html)
         self.assertIn("probe.pgs_mode_available", self.html)
+        self.assertIn("probe.pgs_mode_hint", self.html)
         self.assertIn("probe.pgs_defaults", self.html)
         self.assertIn("probe.video_dimensions", self.html)
 
@@ -46,10 +49,16 @@ class FrontendUiTests(unittest.TestCase):
 
     def test_embed_settings_state_updates_with_mode_changes(self):
         self.assertIn("function updateEmbedSettingsState()", self.html)
+        self.assertIn("const hasAssSubtitle = selectedSubs.some(cb => ['.ass', '.ssa'].includes(cb.dataset.ext))", self.html)
+        self.assertIn("const pgsSelectable = pgsToolAvailable && hasAssSubtitle", self.html)
+        self.assertIn("pgsOption.disabled = !pgsSelectable", self.html)
+        self.assertIn("subtitleMode.value = 'text'", self.html)
+        self.assertIn("请选择至少一个 ASS/SSA 字幕后启用 PGS 转换", self.html)
         self.assertIn("pgsSettingsPanel.classList.toggle('hidden', !pgsEnabled)", self.html)
         self.assertIn("pgsResolution.disabled = !pgsEnabled || pgsResolutionMode.value !== 'custom'", self.html)
         self.assertIn("document.getElementById('subtitleMode').onchange = updateEmbedSettingsState", self.html)
         self.assertIn("document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState", self.html)
+        self.assertIn("cb.onchange = updateEmbedSettingsState", self.html)
 
 
 if __name__ == "__main__":

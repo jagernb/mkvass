@@ -113,10 +113,30 @@ def _resolve_pgs_converter_command() -> str | None:
     return shutil.which(PGS_CONVERTER_CMD)
 
 
-def _pgs_converter_available() -> bool:
+def _pgs_converter_status() -> dict:
     tool = _resolve_pgs_converter_command()
     font_dir = Path(PGS_FONT_DIR) if PGS_FONT_DIR else None
-    return bool(tool and font_dir and font_dir.is_dir())
+    missing = []
+    hints = []
+
+    if not tool:
+        missing.append("converter")
+        configured = PGS_CONVERTER_CMD or "未配置"
+        hints.append(f"未找到 PGS 转换器：{configured}")
+    if font_dir is None or not font_dir.is_dir():
+        missing.append("font_dir")
+        configured = PGS_FONT_DIR or "未配置"
+        hints.append(f"PGS 字体目录不存在：{configured}")
+
+    return {
+        "available": not missing,
+        "hint": "；".join(hints),
+        "missing": missing,
+    }
+
+
+def _pgs_converter_available() -> bool:
+    return bool(_pgs_converter_status()["available"])
 
 
 def _configured_default_output_dir() -> Path | None:
@@ -403,6 +423,8 @@ def api_probe():
             "disposition": s.get("disposition") or {},
         })
 
+    pgs_status = _pgs_converter_status()
+
     return jsonify({
         "path": rel_to_media(target),
         "format": data.get("format", {}),
@@ -412,8 +434,9 @@ def api_probe():
         "default_output_dir": _configured_default_output_dir_rel(),
         "pgs_defaults": _pgs_defaults(),
         "video_dimensions": _video_dimensions(target),
-        "pgs_mode_available": _pgs_converter_available(),
-        "pgs_mode_hint": "需要可用的 PGS 转换器和字体目录" if not _pgs_converter_available() else "",
+        "pgs_mode_available": pgs_status["available"],
+        "pgs_mode_hint": pgs_status["hint"],
+        "pgs_mode_missing": pgs_status["missing"],
     })
 
 
