@@ -312,6 +312,14 @@ def _validate_pgs_options(pgs_options: dict) -> dict:
     }
 
 
+def _standard_pgs_canvas(width: int, height: int) -> str:
+    if width > 1920 or height > 1080:
+        return "3840*2160"
+    if width > 1280 or height > 720:
+        return "1920*1080"
+    return "1280*720"
+
+
 def _derive_pgs_resolution(video: Path, pgs_options: dict) -> str:
     if pgs_options["resolution_mode"] == "custom":
         return pgs_options["resolution"]
@@ -320,7 +328,7 @@ def _derive_pgs_resolution(video: Path, pgs_options: dict) -> str:
     if dims is None:
         return PGS_RESOLUTION
     width, height = dims
-    return f"{width}*{height}"
+    return _standard_pgs_canvas(width, height)
 
 
 def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, framerate: str | None = None) -> tuple[Path, str, Path]:
@@ -476,6 +484,21 @@ def _cleanup_dir(path: Path) -> None:
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
+
+
+@app.route("/api/clear-temp-subtitles", methods=["POST"])
+def api_clear_temp_subtitles():
+    temp_root = TMP_SUBTITLE_ROOT.resolve()
+    if MEDIA_DIR != temp_root and MEDIA_DIR not in temp_root.parents:
+        return jsonify(error="invalid temp directory"), 400
+
+    if not temp_root.exists():
+        return jsonify({"ok": True, "cleared": False})
+    if not temp_root.is_dir():
+        return jsonify(error="invalid temp directory"), 400
+
+    _cleanup_dir(temp_root)
+    return jsonify({"ok": True, "cleared": True})
 
 
 @app.route("/api/download")

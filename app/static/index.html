@@ -51,6 +51,7 @@
   .download-btn { display: inline-block; background: #00b376; color: #fff; text-decoration: none;
                   padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; }
   .tag.temp { background: #7c4dff33; color: #c9b3ff; }
+  .browser-actions { padding: 10px 14px; border-bottom: 1px solid #1a1d24; background: #11141b; }
 </style>
 </head>
 <body>
@@ -62,6 +63,10 @@
 </header>
 <main>
   <div id="browser">
+    <div class="row browser-actions">
+      <button id="refreshDirBtn" class="secondary">刷新目录</button>
+      <button id="clearTempBtn" class="secondary">清空临时区</button>
+    </div>
     <ul class="list" id="fileList"></ul>
   </div>
   <div id="detail">
@@ -120,6 +125,46 @@ async function loadDir(path='') {
   state.parent = data.parent;
   renderList();
   document.getElementById('crumbs').textContent = '/' + (data.cwd || '');
+}
+
+async function refreshCurrentDir() {
+  const btn = document.getElementById('refreshDirBtn');
+  if (btn) btn.disabled = true;
+  try {
+    const selectedPath = state.selected?.path || null;
+    await loadDir(state.cwd);
+    if (selectedPath) {
+      const nextSelected = state.entries.find(e => e.path === selectedPath && e.role === 'video');
+      if (nextSelected) {
+        state.selected = nextSelected;
+        await showVideo(nextSelected);
+      } else {
+        state.selected = null;
+        document.getElementById('content').style.display = 'none';
+        document.getElementById('empty').style.display = '';
+        document.getElementById('empty').textContent = '选择一个视频文件查看字幕轨道。';
+      }
+    }
+  } catch (e) {
+    alert('刷新目录失败: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function clearTempSubtitles() {
+  if (!confirm('确定删除所有临时区字幕文件？此操作不可撤销。')) return;
+  const btn = document.getElementById('clearTempBtn');
+  if (btn) btn.disabled = true;
+  try {
+    await api('/api/clear-temp-subtitles', { method: 'POST' });
+    await refreshCurrentDir();
+    alert('临时区已清空');
+  } catch (e) {
+    alert('清空临时区失败: ' + e.message);
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function renderList() {
@@ -228,8 +273,8 @@ function renderDetail(entry, probe) {
   const pgsFramerate = videoFramerate?.raw || pgsDefaults.framerate || '23.976';
   const videoDimensions = probe.video_dimensions;
   const videoDimensionsText = Array.isArray(videoDimensions) && videoDimensions.length === 2
-    ? `${videoDimensions[0]}*${videoDimensions[1]}`
-    : '将自动按视频分辨率推导';
+    ? `${videoDimensions[0]}*${videoDimensions[1]}（PGS 跟随模式会使用标准画布）`
+    : '将自动按视频分辨率推导标准画布';
 
   c.innerHTML = `
     <section>
@@ -498,6 +543,8 @@ async function doEmbed(entry) {
   }
 }
 
+document.getElementById('refreshDirBtn').onclick = refreshCurrentDir;
+document.getElementById('clearTempBtn').onclick = clearTempSubtitles;
 loadVersion();
 loadDir('');
 </script>
