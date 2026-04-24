@@ -52,6 +52,12 @@
                   padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; }
   .tag.temp { background: #7c4dff33; color: #c9b3ff; }
   .browser-actions { padding: 10px 14px; border-bottom: 1px solid #1a1d24; background: #11141b; }
+  .task-card { border: 1px solid #222; border-radius: 8px; padding: 10px; margin-top: 8px; background: #11141b; }
+  .task-card.done { border-color: #00b37655; }
+  .task-card.failed { border-color: #ff5c5c66; }
+  .progress { width: 180px; height: 8px; background: #252a35; border-radius: 999px; overflow: hidden; }
+  .progress-bar { height: 100%; background: #2b64ff; width: 0%; transition: width .2s ease; }
+  .task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; align-items: center; }
 </style>
 </head>
 <body>
@@ -70,13 +76,17 @@
     <ul class="list" id="fileList"></ul>
   </div>
   <div id="detail">
+    <section id="taskPanel">
+      <h2>当前任务</h2>
+      <div id="taskList" class="muted">暂无任务</div>
+    </section>
     <div id="empty" class="muted">选择一个视频文件查看字幕轨道。</div>
     <div id="content" style="display:none"></div>
   </div>
 </main>
 
 <script>
-let state = { cwd: '', entries: [], selected: null, probe: null };
+let state = { cwd: '', entries: [], selected: null, probe: null, tasks: [], taskStatuses: {} };
 
 async function api(path, opts={}) {
   const res = await fetch(path, opts);
@@ -223,6 +233,108 @@ function subtitleExt(path) {
   const name = String(path || '').split(/[\\/]/).pop();
   const index = name.lastIndexOf('.');
   return index >= 0 ? name.slice(index).toLowerCase() : '';
+}
+
+function basename(path) {
+  return String(path || '').split(/[\\/]/).pop() || path || '';
+}
+
+function taskStatusText(status) {
+  return {
+    pending: '等待中',
+    running: '执行中',
+    canceling: '取消中',
+    canceled: '已取消',
+    succeeded: '完成',
+    failed: '失败',
+  }[status] || status || '';
+}
+
+function taskPhaseText(phase) {
+  return {
+    queued: '排队',
+    pgs: 'PGS 转换',
+    embed: '封装',
+    done: '完成',
+    error: '失败',
+    canceled: '已取消',
+  }[phase] || phase || '';
+}
+
+function progressHtml(title, progress) {
+  const percent = Math.max(0, Math.min(100, Number(progress?.percent || 0)));
+  const estimated = progress?.estimated ? '（估算）' : '';
+  const label = progress?.label ? `<div class="muted">${escapeHtml(progress.label)}</div>` : '';
+  return `<div>
+    <div class="row"><span>${title}: ${percent}%${estimated}</span><div class="progress"><div class="progress-bar" style="width:${percent}%"></div></div></div>
+    ${label}
+  </div>`;
+}
+
+function renderTasks() {
+  const box = document.getElementById('taskList');
+  if (!box) return;
+  if (!state.tasks.length) {
+    box.className = 'muted';
+    box.textContent = '暂无任务';
+    return;
+  }
+  box.className = '';
+  box.innerHTML = state.tasks.map(task => {
+    const doneClass = task.status === 'succeeded' ? ' done' : task.status === 'failed' ? ' failed' : '';
+    const canCancel = ['pending', 'running', 'canceling'].includes(task.status);
+    const warningText = Array.isArray(task.warnings) && task.warnings.length ? `<div class="muted">警告: ${escapeHtml(task.warnings.join('；'))}</div>` : '';
+    const errorText = task.error ? `<div style="color:#f66">${escapeHtml(task.error)}</div>` : '';
+    const outputText = task.output ? `<div class="muted">输出: ${escapeHtml(task.output)}</div>` : '';
+    return `<div class="task-card${doneClass}">
+      <div class="task-grid">
+        <div>
+          <strong>${escapeHtml(basename(task.video))}</strong>
+          <div class="muted">${taskStatusText(task.status)} · ${taskPhaseText(task.phase)}</div>
+        </div>
+        ${progressHtml('PGS', task.pgs_progress)}
+        ${progressHtml('封装', task.embed_progress)}
+        <div class="row">
+          ${canCancel ? `<button class="secondary" data-cancel-task="${escapeHtml(task.id)}" ${task.status === 'canceling' ? 'disabled' : ''}>取消</button>` : ''}
+        </div>
+      </div>
+      <div class="muted">${escapeHtml(task.message || '')}</div>
+      ${outputText}
+      ${warningText}
+      ${errorText}
+    </div>`;
+  }).join('');
+  box.querySelectorAll('[data-cancel-task]').forEach(btn => {
+    btn.onclick = () => cancelTask(btn.dataset.cancelTask);
+  });
+}
+
+async function loadTasks() {
+  try {
+    const data = await api('/api/tasks');
+    const nextTasks = data.tasks || [];
+    const previous = state.taskStatuses;
+    const nextStatuses = {};
+    let shouldRefresh = false;
+    for (const task of nextTasks) {
+      nextStatuses[task.id] = task.status;
+      if (previous[task.id] && previous[task.id] !== task.status && ['succeeded', 'failed', 'canceled'].includes(task.status)) {
+        shouldRefresh = true;
+      }
+    }
+    state.tasks = nextTasks;
+    state.taskStatuses = nextStatuses;
+    renderTasks();
+    if (shouldRefresh) await refreshCurrentDir();
+  } catch (e) {
+    const box = document.getElementById('taskList');
+    if (box) box.textContent = '任务列表加载失败: ' + e.message;
+  }
+}
+
+async function cancelTask(taskId) {
+  await api(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+  await loadTasks();
 }
 
 function renderDetail(entry, probe) {
@@ -479,7 +591,7 @@ async function doEmbed(entry) {
   });
   const body = {
     video: entry.path,
-    subtitles: subs,
+    subtitles: subs.map(({ext, ...sub}) => sub),
     keep_existing: document.getElementById('keepExisting').checked,
     use_default_output_dir: document.getElementById('useDefaultOutputDir').checked,
     subtitle_mode: document.getElementById('subtitleMode').value,
@@ -490,54 +602,23 @@ async function doEmbed(entry) {
     },
     out_name: document.getElementById('outName').value || null,
   };
-  log.textContent = '封装中（可能较慢，请勿关闭页面）...';
   const btn = document.getElementById('doEmbed');
   btn.disabled = true;
+  log.textContent = '正在添加任务...';
   try {
-    if (body.subtitle_mode === 'pgs_auto') {
-      const embedSubs = [];
-      for (const sub of subs) {
-        if (['.ass', '.ssa'].includes(sub.ext)) {
-          log.textContent = `正在转换为 PGS: ${sub.path}`;
-          const converted = await api('/api/convert-ass-to-pgs', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-              video: entry.path,
-              subtitle: sub.path,
-              pgs_options: body.pgs_options,
-            }),
-          });
-          embedSubs.push({...sub, path: converted.output, ext: subtitleExt(converted.output)});
-        } else {
-          embedSubs.push(sub);
-        }
-      }
-      body.subtitles = embedSubs.map(({ext, ...sub}) => sub);
-      log.textContent = 'PGS 已生成，刷新目录后开始封装...';
-      await loadDir(state.cwd);
-    } else {
-      body.subtitles = subs.map(({ext, ...sub}) => sub);
-    }
-
-    log.textContent = '开始封装（可能较慢，请勿关闭页面）...';
-    const res = await api('/api/embed', {
+    const res = await api('/api/tasks/embed', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    const warningText = Array.isArray(res.warnings) && res.warnings.length
-      ? `\n警告: ${res.warnings.join('；')}`
-      : '';
-    log.textContent = `已生成: ${res.output}\n输出目录: ${res.output_dir || '/'}\n封装器: ${res.muxer || 'ffmpeg'}\n字幕模式: ${res.subtitle_mode}\n默认输出路径: ${res.used_default_output_dir ? '是' : '否'}${res.pgs_settings ? `\nPGS 尺寸: ${res.pgs_settings.resolution}\nPGS 帧率: ${res.pgs_settings.framerate}` : ''}${warningText}\n\n${res.cmd}`;
-    await loadDir(state.cwd);
+    log.textContent = `任务已添加: ${res.task.id}\n可继续切换目录添加其他任务，后台会按添加顺序执行。`;
+    await loadTasks();
   } catch (e) {
     const errorParts = ['失败: ' + e.message];
     if (e.data?.cmd) errorParts.push('命令: ' + e.data.cmd);
     const detail = e.data?.detail || e.data?.stdout;
     if (detail) errorParts.push('日志: ' + detail);
     log.textContent = errorParts.join('\n\n');
-    await loadDir(state.cwd);
   } finally {
     btn.disabled = false;
   }
@@ -546,6 +627,8 @@ async function doEmbed(entry) {
 document.getElementById('refreshDirBtn').onclick = refreshCurrentDir;
 document.getElementById('clearTempBtn').onclick = clearTempSubtitles;
 loadVersion();
+loadTasks();
+setInterval(loadTasks, 2000);
 loadDir('');
 </script>
 </body>

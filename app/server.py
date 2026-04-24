@@ -7,13 +7,18 @@
 """
 from __future__ import annotations
 
+from collections import deque
 import json
 import os
+import queue
 import re
 import shlex
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import uuid
 from pathlib import Path
 from urllib.parse import quote
 
@@ -38,6 +43,12 @@ PGS_SUBTITLE_EXTS = {".pgs", ".sup"}
 SUBTITLE_EXTS = TEXT_SUBTITLE_EXTS | PGS_SUBTITLE_EXTS
 DOWNLOADABLE_SUBTITLE_EXTS = SUBTITLE_EXTS
 TMP_SUBTITLE_ROOT = MEDIA_DIR / ".tmp_subtitles"
+TASKS: dict[str, dict] = {}
+TASK_QUEUE: deque[str] = deque()
+TASK_LOCK = threading.RLock()
+TASK_EVENT = threading.Event()
+TASK_WORKER_STARTED = False
+FINAL_TASK_STATUSES = {"canceled", "succeeded", "failed"}
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
@@ -493,6 +504,456 @@ def _cleanup_dir(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
+def _now() -> float:
+    return time.time()
+
+
+def _progress(percent: int = 0, label: str = "", estimated: bool = False) -> dict:
+    return {"percent": max(0, min(100, int(percent))), "label": label, "estimated": estimated}
+
+
+def _public_task(task: dict) -> dict:
+    return {
+        key: value
+        for key, value in task.items()
+        if key not in {"process", "body", "prepared_subs", "temp_files_to_cleanup"}
+    }
+
+
+def _update_task(task_id: str, **updates) -> dict:
+    with TASK_LOCK:
+        task = TASKS[task_id]
+        task.update(updates)
+        task["updated_at"] = _now()
+        return task
+
+
+def _set_task_progress(task_id: str, key: str, percent: int, label: str = "", estimated: bool = False) -> None:
+    with TASK_LOCK:
+        task = TASKS[task_id]
+        task[key] = _progress(percent, label, estimated)
+        task["updated_at"] = _now()
+
+
+def _task_cancel_requested(task_id: str) -> bool:
+    with TASK_LOCK:
+        return bool(TASKS[task_id].get("cancel_requested"))
+
+
+def _task_cmd_text(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(c) for c in cmd)
+
+
+def _trim_task_output(output: str) -> str:
+    return output[-4000:] if len(output) > 4000 else output
+
+
+def _video_duration_seconds(video: Path) -> float | None:
+    try:
+        probe = subprocess.check_output([
+            "ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video),
+        ], stderr=subprocess.STDOUT, timeout=60)
+    except Exception:
+        return None
+    try:
+        duration = float(json.loads(probe.decode()).get("format", {}).get("duration") or 0)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return duration if duration > 0 else None
+
+
+def _parse_ffmpeg_progress(line: str, duration: float | None) -> int | None:
+    if not duration:
+        return None
+    if line.startswith("out_time_ms="):
+        try:
+            seconds = int(line.split("=", 1)[1]) / 1_000_000
+        except ValueError:
+            return None
+        return min(99, int(seconds / duration * 100))
+    if line.startswith("out_time="):
+        raw = line.split("=", 1)[1].strip()
+        parts = raw.split(":")
+        if len(parts) != 3:
+            return None
+        try:
+            seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+        except ValueError:
+            return None
+        return min(99, int(seconds / duration * 100))
+    return None
+
+
+def _parse_mkvmerge_progress(line: str) -> int | None:
+    patterns = [r"Progress:\s*(\d+)%", r"#GUI#progress\s+(\d+)"]
+    for pattern in patterns:
+        match = re.search(pattern, line)
+        if match:
+            return min(99, int(match.group(1)))
+    return None
+
+
+def _parse_percent(line: str) -> int | None:
+    match = re.search(r"(?<!\d)(\d{1,3})%", line)
+    if not match:
+        return None
+    return min(99, int(match.group(1)))
+
+
+def _enqueue_process_output(process: subprocess.Popen, output_queue: queue.Queue) -> None:
+    if process.stdout is None:
+        return
+    for line in process.stdout:
+        output_queue.put(line)
+
+
+def _terminate_process(process: subprocess.Popen) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+
+
+def _run_task_process(
+    task_id: str,
+    cmd: list[str],
+    *,
+    phase: str,
+    progress_key: str,
+    progress_parser=None,
+    timeout: int = 3600,
+    complete_percent: int = 100,
+) -> str:
+    cmd_text = _task_cmd_text(cmd)
+    _update_task(task_id, cmd=cmd_text, message=f"正在执行: {phase}")
+    output_lines = []
+    started = _now()
+    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
+    output_queue: queue.Queue[str] = queue.Queue()
+    threading.Thread(target=_enqueue_process_output, args=(process, output_queue), daemon=True).start()
+    with TASK_LOCK:
+        TASKS[task_id]["process"] = process
+    try:
+        while True:
+            if _task_cancel_requested(task_id):
+                _terminate_process(process)
+                raise RuntimeError("task canceled")
+            if timeout and _now() - started > timeout:
+                _terminate_process(process)
+                raise RuntimeError("task timed out")
+            try:
+                line = output_queue.get(timeout=0.2)
+            except queue.Empty:
+                if process.poll() is not None:
+                    break
+                continue
+            line = line.rstrip()
+            output_lines.append(line)
+            _update_task(task_id, message=line or f"正在执行: {phase}")
+            if progress_parser:
+                percent = progress_parser(line)
+                if percent is not None:
+                    _set_task_progress(task_id, progress_key, percent, line, False)
+
+        while True:
+            try:
+                line = output_queue.get_nowait().rstrip()
+            except queue.Empty:
+                break
+            output_lines.append(line)
+        output = _trim_task_output("\n".join(output_lines))
+        if process.returncode != 0:
+            raise RuntimeError(output or f"{phase} failed")
+        _set_task_progress(task_id, progress_key, complete_percent, f"{phase}完成", False)
+        return output
+    finally:
+        with TASK_LOCK:
+            if TASKS.get(task_id, {}).get("process") is process:
+                TASKS[task_id]["process"] = None
+
+
+def _convert_ass_to_pgs_for_task(
+    task_id: str,
+    subtitle_path: Path,
+    *,
+    resolution: str,
+    framerate: str,
+    progress_offset: int = 0,
+    progress_span: int = 100,
+) -> tuple[Path, str]:
+    if subtitle_path.suffix.lower() not in {".ass", ".ssa"}:
+        raise ValueError("pgs conversion only supports ass/ssa")
+
+    tool = _resolve_pgs_converter_command()
+    if not tool:
+        raise RuntimeError("pgs converter not configured")
+
+    font_dir = Path(PGS_FONT_DIR) if PGS_FONT_DIR else None
+    if font_dir is None or not font_dir.is_dir():
+        raise RuntimeError("pgs font dir not found")
+
+    temp_root = TMP_SUBTITLE_ROOT / "_pgs"
+    temp_root.mkdir(parents=True, exist_ok=True)
+    work_dir = Path(tempfile.mkdtemp(prefix="pgs-", dir=temp_root))
+    input_dir = work_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_path = input_dir / subtitle_path.name
+    shutil.copy2(subtitle_path, input_path)
+
+    cmd = [
+        tool,
+        "--enable-pgs-output",
+        "--resolution",
+        resolution,
+        "--framerate",
+        framerate,
+        "subset",
+        str(input_path),
+        "--font-dir",
+        str(font_dir),
+        "--output-dir",
+        str(work_dir),
+    ]
+    cmd_text = _task_cmd_text(cmd)
+    try:
+        def parse_pgs_progress(line: str) -> int | None:
+            percent = _parse_percent(line)
+            if percent is None:
+                return None
+            return min(99, progress_offset + int(percent * progress_span / 100))
+
+        _run_task_process(
+            task_id,
+            cmd,
+            phase="PGS 转换",
+            progress_key="pgs_progress",
+            progress_parser=parse_pgs_progress,
+            complete_percent=min(100, progress_offset + progress_span),
+        )
+        candidates = sorted(
+            path
+            for path in work_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
+        )
+        if not candidates:
+            produced = sorted(str(path.relative_to(work_dir)) for path in work_dir.rglob("*") if path.is_file())
+            detail = f": {', '.join(produced)}" if produced else ""
+            raise RuntimeError(f"pgs converter did not produce a new .pgs or .sup file{detail}")
+        output_path = candidates[0]
+        target_name = f"{subtitle_path.stem}{output_path.suffix.lower()}"
+        target_path = _unique_file_path(subtitle_path.parent, target_name)
+        shutil.copy2(output_path, target_path)
+        return target_path, cmd_text
+    finally:
+        _cleanup_dir(work_dir)
+
+
+def _build_ffmpeg_progress_command(cmd: list[str]) -> list[str]:
+    return cmd[:-1] + ["-progress", "pipe:1", "-nostats", cmd[-1]]
+
+
+def _build_mkvmerge_progress_command(cmd: list[str]) -> list[str]:
+    if "--gui-mode" in cmd:
+        return cmd
+    return [cmd[0], "--gui-mode"] + cmd[1:]
+
+
+def _prepare_embed_task(body: dict) -> tuple[Path, list[tuple[Path, dict]], Path, dict, bool, str]:
+    video_rel = body.get("video")
+    subs = body.get("subtitles") or []
+    out_name = body.get("out_name")
+    subtitle_mode = (body.get("subtitle_mode") or "text").strip() or "text"
+    if not video_rel or not subs:
+        raise ValueError("video and subtitles required")
+    if subtitle_mode not in {"text", "pgs_auto"}:
+        raise ValueError("invalid subtitle mode")
+
+    embed_settings = _normalize_embed_settings(body)
+    pgs_options = _validate_pgs_options(embed_settings["pgs_options"])
+    use_default_output_dir = embed_settings["use_default_output_dir"]
+
+    video = safe_path(video_rel)
+    if not video.is_file():
+        raise FileNotFoundError("video not found")
+    if video.suffix.lower() not in VIDEO_EXTS:
+        raise ValueError("unsupported video type")
+
+    sub_paths = []
+    for sub in subs:
+        sp = safe_path(sub.get("path", ""))
+        if not sp.is_file():
+            raise FileNotFoundError(f"subtitle not found: {sub.get('path')}")
+        if sp.suffix.lower() not in SUBTITLE_EXTS:
+            raise ValueError(f"unsupported subtitle type: {sub.get('path')}")
+        sub_paths.append((sp, sub))
+
+    out_path = _resolve_embed_output_path(video, out_name, use_default_output_dir)
+    return video, sub_paths, out_path, pgs_options, use_default_output_dir, subtitle_mode
+
+
+def _run_embed_task(task_id: str) -> None:
+    with TASK_LOCK:
+        body = TASKS[task_id]["body"]
+    keep_existing = bool(body.get("keep_existing", True))
+    video = None
+    out_path = None
+    prepared_subs = []
+    warnings = []
+    cmd_text = ""
+
+    try:
+        video, sub_paths, out_path, pgs_options, use_default_output_dir, subtitle_mode = _prepare_embed_task(body)
+        temp_files_to_cleanup = [sp for sp, _meta in sub_paths if _is_temp_subtitle(sp, video)]
+        resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
+        ass_subtitles = [(sp, meta) for sp, meta in sub_paths if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}]
+        if ass_subtitles:
+            _update_task(task_id, phase="pgs", message="开始 PGS 转换")
+            total = len(ass_subtitles)
+            done = 0
+            for sp, meta in sub_paths:
+                if _task_cancel_requested(task_id):
+                    raise RuntimeError("task canceled")
+                if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}:
+                    base_percent = int(done / total * 100)
+                    _set_task_progress(task_id, "pgs_progress", base_percent, f"正在转换: {rel_to_media(sp)}", True)
+                    converted_path, cmd_text = _convert_ass_to_pgs_for_task(
+                        task_id,
+                        sp,
+                        resolution=resolved_pgs_resolution,
+                        framerate=pgs_options["framerate"],
+                        progress_offset=base_percent,
+                        progress_span=int(100 / total),
+                    )
+                    done += 1
+                    _set_task_progress(task_id, "pgs_progress", int(done / total * 100), f"已转换: {rel_to_media(converted_path)}", True)
+                    prepared_subs.append({"path": converted_path, "meta": meta, "codec": "copy"})
+                else:
+                    codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
+                    prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
+        else:
+            _set_task_progress(task_id, "pgs_progress", 100, "无需 PGS 转换", False)
+            for sp, meta in sub_paths:
+                codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
+                prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
+
+        has_pgs_subtitle = any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs)
+        muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
+        warnings = _subtitle_warning_for_existing_pgs(prepared_subs)
+        _update_task(task_id, phase="embed", muxer=muxer, warnings=warnings, message="开始封装")
+        if muxer == "mkvmerge":
+            cmd = _build_mkvmerge_progress_command(_build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing))
+            progress_parser = _parse_mkvmerge_progress
+        else:
+            cmd = _build_ffmpeg_progress_command(_build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing))
+            duration = _video_duration_seconds(video)
+            progress_parser = lambda line: _parse_ffmpeg_progress(line, duration)
+        cmd_text = _task_cmd_text(cmd)
+        _run_task_process(task_id, cmd, phase="封装", progress_key="embed_progress", progress_parser=progress_parser)
+
+        for temp_file in temp_files_to_cleanup:
+            if temp_file.exists():
+                temp_file.unlink()
+        temp_dir = _video_temp_dir(video)
+        if temp_dir.exists() and temp_dir.is_dir() and not any(temp_dir.iterdir()):
+            temp_dir.rmdir()
+
+        output_dir = rel_to_media(out_path.parent) if out_path.parent != MEDIA_DIR else ""
+        _update_task(
+            task_id,
+            status="succeeded",
+            phase="done",
+            output=rel_to_media(out_path),
+            output_dir=output_dir,
+            subtitle_mode=subtitle_mode,
+            used_default_output_dir=use_default_output_dir,
+            muxer=muxer,
+            warnings=warnings,
+            pgs_settings={
+                "resolution_mode": pgs_options["resolution_mode"],
+                "resolution": resolved_pgs_resolution,
+                "framerate": pgs_options["framerate"],
+                "applies_to": "ass_to_pgs_conversion_only",
+                "applied_to_existing_pgs": False,
+            },
+            cmd=cmd_text,
+            message="任务完成",
+        )
+    except Exception as exc:
+        if _task_cancel_requested(task_id) or str(exc) == "task canceled":
+            if out_path is not None and out_path.exists():
+                out_path.unlink()
+            _update_task(task_id, status="canceled", phase="canceled", message="任务已取消", error="")
+        else:
+            _update_task(task_id, status="failed", phase="error", message="任务失败", error=str(exc), cmd=cmd_text, warnings=warnings)
+
+
+def _task_worker() -> None:
+    while True:
+        TASK_EVENT.wait()
+        while True:
+            with TASK_LOCK:
+                while TASK_QUEUE and TASKS.get(TASK_QUEUE[0], {}).get("status") != "pending":
+                    TASK_QUEUE.popleft()
+                if not TASK_QUEUE:
+                    TASK_EVENT.clear()
+                    break
+                task_id = TASK_QUEUE.popleft()
+                task = TASKS[task_id]
+                task["status"] = "running"
+                task["phase"] = "queued"
+                task["updated_at"] = _now()
+            _run_embed_task(task_id)
+
+
+def _ensure_task_worker() -> None:
+    global TASK_WORKER_STARTED
+    with TASK_LOCK:
+        if TASK_WORKER_STARTED:
+            return
+        TASK_WORKER_STARTED = True
+    threading.Thread(target=_task_worker, daemon=True, name="subtitle-task-worker").start()
+
+
+def _create_embed_task(body: dict) -> dict:
+    task_id = uuid.uuid4().hex
+    now = _now()
+    task = {
+        "id": task_id,
+        "type": "embed",
+        "created_at": now,
+        "updated_at": now,
+        "status": "pending",
+        "phase": "queued",
+        "video": body.get("video") or "",
+        "out_name": body.get("out_name") or "",
+        "output": "",
+        "output_dir": "",
+        "subtitle_mode": body.get("subtitle_mode") or "text",
+        "pgs_progress": _progress(0, "等待 PGS 转换", False),
+        "embed_progress": _progress(0, "等待封装", False),
+        "message": "等待执行",
+        "cmd": "",
+        "error": "",
+        "warnings": [],
+        "muxer": "",
+        "pgs_settings": None,
+        "used_default_output_dir": False,
+        "cancel_requested": False,
+        "process": None,
+        "body": body,
+    }
+    with TASK_LOCK:
+        TASKS[task_id] = task
+        TASK_QUEUE.append(task_id)
+        TASK_EVENT.set()
+    _ensure_task_worker()
+    return task
+
+
 @app.route("/")
 def index():
     return send_from_directory(app.static_folder, "index.html")
@@ -792,6 +1253,62 @@ def api_convert_ass_to_pgs():
         },
         "cmd": conversion_cmd,
     })
+
+
+@app.route("/api/tasks/embed", methods=["POST"])
+def api_create_embed_task():
+    body = request.get_json(silent=True) or {}
+    try:
+        _prepare_embed_task(body)
+    except FileNotFoundError as exc:
+        return jsonify(error=str(exc)), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    task = _create_embed_task(body)
+    return jsonify({"ok": True, "task": _public_task(task)}), 202
+
+
+@app.route("/api/tasks")
+def api_tasks():
+    with TASK_LOCK:
+        tasks = sorted((_public_task(task) for task in TASKS.values()), key=lambda task: task["created_at"])
+    return jsonify({"tasks": tasks})
+
+
+@app.route("/api/tasks/<task_id>")
+def api_task(task_id: str):
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if task is None:
+            return jsonify(error="task not found"), 404
+        data = _public_task(task)
+    return jsonify(data)
+
+
+@app.route("/api/tasks/<task_id>/cancel", methods=["POST"])
+def api_cancel_task(task_id: str):
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if task is None:
+            return jsonify(error="task not found"), 404
+        if task["status"] in FINAL_TASK_STATUSES:
+            return jsonify({"ok": True, "task": _public_task(task)})
+        task["cancel_requested"] = True
+        task["updated_at"] = _now()
+        if task["status"] == "pending":
+            task["status"] = "canceled"
+            task["phase"] = "canceled"
+            task["message"] = "任务已取消"
+            return jsonify({"ok": True, "task": _public_task(task)})
+        task["status"] = "canceling"
+        task["phase"] = "canceled"
+        task["message"] = "正在取消任务"
+        process = task.get("process")
+        if process is not None and process.poll() is None:
+            process.terminate()
+        data = _public_task(task)
+    return jsonify({"ok": True, "task": data})
 
 
 @app.route("/api/embed", methods=["POST"])
