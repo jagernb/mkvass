@@ -42,6 +42,13 @@ TMP_SUBTITLE_ROOT = MEDIA_DIR / ".tmp_subtitles"
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 
+class PgsConversionError(RuntimeError):
+    def __init__(self, message: str, *, cmd_text: str = "", output: str = ""):
+        super().__init__(message)
+        self.cmd_text = cmd_text
+        self.output = output
+
+
 def safe_path(rel: str) -> Path:
     rel = (rel or "").lstrip("/\\")
     target = (MEDIA_DIR / rel).resolve()
@@ -334,13 +341,10 @@ def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, f
     temp_root = TMP_SUBTITLE_ROOT / "_pgs"
     temp_root.mkdir(parents=True, exist_ok=True)
     work_dir = Path(tempfile.mkdtemp(prefix="pgs-", dir=temp_root))
-    subset_dir = work_dir / "subsetted"
-    output_path = subset_dir / f"{subtitle_path.name}.pgs"
-    sibling_outputs_before = {
-        path.resolve()
-        for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*")
-        if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
-    }
+    input_dir = work_dir / "input"
+    input_dir.mkdir(parents=True, exist_ok=True)
+    input_path = input_dir / subtitle_path.name
+    shutil.copy2(subtitle_path, input_path)
 
     cmd = [
         tool,
@@ -350,42 +354,33 @@ def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, f
         "--framerate",
         resolved_framerate,
         "subset",
-        str(subtitle_path),
+        str(input_path),
         "--font-dir",
         str(font_dir),
         "--output-dir",
         str(work_dir),
     ]
+    cmd_text = " ".join(shlex.quote(c) for c in cmd)
 
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
     except subprocess.CalledProcessError as exc:
-        raise RuntimeError(exc.output.decode(errors="ignore") or "pgs conversion failed") from exc
+        output = exc.output.decode(errors="ignore") if exc.output else ""
+        raise PgsConversionError(output or "pgs conversion failed", cmd_text=cmd_text, output=output) from exc
 
-    if not output_path.exists():
-        work_dir_outputs = [
-            path
-            for path in work_dir.rglob("*")
-            if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
-        ]
-        sibling_outputs_after = [
-            path
-            for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*")
-            if path.is_file()
-            and path.suffix.lower() in {".pgs", ".sup"}
-            and path.resolve() not in sibling_outputs_before
-        ]
-        candidates = sorted(work_dir_outputs + sibling_outputs_after)
-        if candidates:
-            output_path = candidates[0]
-        else:
-            produced = sorted(str(path.relative_to(work_dir)) for path in work_dir.rglob("*") if path.is_file())
-            sibling_produced = sorted(path.name for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*") if path.is_file())
-            detail_items = produced + [f"{subtitle_path.parent.name}/{name}" for name in sibling_produced]
-            detail = f": {', '.join(detail_items)}" if detail_items else ""
-            raise RuntimeError(f"pgs converter did not produce a new .pgs or .sup file{detail}")
+    candidates = sorted(
+        path
+        for path in work_dir.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
+    )
+    if candidates:
+        output_path = candidates[0]
+    else:
+        produced = sorted(str(path.relative_to(work_dir)) for path in work_dir.rglob("*") if path.is_file())
+        detail = f": {', '.join(produced)}" if produced else ""
+        raise RuntimeError(f"pgs converter did not produce a new .pgs or .sup file{detail}")
 
-    return output_path, " ".join(shlex.quote(c) for c in cmd), work_dir
+    return output_path, cmd_text, work_dir
 
 
 def _subtitle_warning_for_existing_pgs(prepared_subs: list[dict]) -> list[str]:
@@ -465,7 +460,7 @@ def _convert_ass_to_pgs_persistent(subtitle_path: Path, *, resolution: str | Non
         if output_path.parent.resolve() == subtitle_path.parent.resolve():
             return output_path, cmd_text
 
-        target_name = f"{subtitle_path.name}{output_path.suffix.lower()}"
+        target_name = f"{subtitle_path.stem}{output_path.suffix.lower()}"
         target_path = _unique_file_path(subtitle_path.parent, target_name)
         shutil.copy2(output_path, target_path)
         return target_path, cmd_text
@@ -744,6 +739,8 @@ def api_convert_ass_to_pgs():
             resolution=resolved_pgs_resolution,
             framerate=pgs_options["framerate"],
         )
+    except PgsConversionError as exc:
+        return jsonify(error=str(exc), detail=exc.output, stdout=exc.output, cmd=exc.cmd_text), 400
     except (RuntimeError, ValueError) as exc:
         return jsonify(error=str(exc)), 400
 
