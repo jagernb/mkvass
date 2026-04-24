@@ -270,7 +270,7 @@ function renderDetail(entry, probe) {
   const pgsResolution = pgsDefaults.resolution || '1920*1080';
   const videoFramerate = probe.video_framerate || null;
   const videoFramerateText = videoFramerate?.display || '未探测到';
-  const pgsFramerate = videoFramerate?.raw || pgsDefaults.framerate || '23.976';
+  const pgsFramerate = videoFramerate?.display ? videoFramerate.display.replace(' fps', '') : (pgsDefaults.framerate || '23.976');
   const videoDimensions = probe.video_dimensions;
   const videoDimensionsText = Array.isArray(videoDimensions) && videoDimensions.length === 2
     ? `${videoDimensions[0]}*${videoDimensions[1]}（PGS 跟随模式会使用标准画布）`

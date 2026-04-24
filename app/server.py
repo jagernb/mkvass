@@ -206,6 +206,10 @@ def _count_subtitle_streams(video: Path) -> int:
     return len(json.loads(probe.decode()).get("streams", []))
 
 
+def _format_frame_rate_value(value: float) -> str:
+    return f"{value:.3f}".rstrip("0").rstrip(".")
+
+
 def _parse_frame_rate(raw: str | None, source: str) -> dict | None:
     raw = (raw or "").strip()
     if not raw or raw == "0/0":
@@ -223,8 +227,15 @@ def _parse_frame_rate(raw: str | None, source: str) -> dict | None:
             return None
     if value <= 0:
         return None
-    display_value = f"{value:.3f}".rstrip("0").rstrip(".")
+    display_value = _format_frame_rate_value(value)
     return {"raw": raw, "value": value, "display": f"{display_value} fps", "source": source}
+
+
+def _normalize_pgs_framerate(framerate: str) -> str:
+    parsed = _parse_frame_rate(framerate, "pgs_framerate")
+    if parsed is None:
+        raise ValueError("invalid pgs framerate")
+    return _format_frame_rate_value(parsed["value"])
 
 
 def _video_framerate(streams: list[dict]) -> dict | None:
@@ -304,6 +315,7 @@ def _validate_pgs_options(pgs_options: dict) -> dict:
     framerate = (pgs_options.get("framerate") or PGS_FRAMERATE).strip()
     if not re.fullmatch(r"\d+(?:\.\d+)?(?:/\d+(?:\.\d+)?)?", framerate):
         raise ValueError("invalid pgs framerate")
+    framerate = _normalize_pgs_framerate(framerate)
 
     return {
         "resolution_mode": resolution_mode,
