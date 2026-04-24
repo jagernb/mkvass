@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import zipfile
 from pathlib import Path
 from urllib.parse import quote
 
@@ -43,6 +44,7 @@ PGS_SUBTITLE_EXTS = {".pgs", ".sup"}
 SUBTITLE_EXTS = TEXT_SUBTITLE_EXTS | PGS_SUBTITLE_EXTS
 DOWNLOADABLE_SUBTITLE_EXTS = SUBTITLE_EXTS
 TMP_SUBTITLE_ROOT = MEDIA_DIR / ".tmp_subtitles"
+TASK_DIAGNOSTIC_ROOT = TMP_SUBTITLE_ROOT / "_diagnostics"
 TASKS: dict[str, dict] = {}
 TASK_QUEUE: deque[str] = deque()
 TASK_LOCK = threading.RLock()
@@ -535,6 +537,23 @@ def _set_task_progress(task_id: str, key: str, percent: int, label: str = "", es
         task["updated_at"] = _now()
 
 
+def _append_task_log(task_id: str, line: str) -> None:
+    with TASK_LOCK:
+        task = TASKS[task_id]
+        logs = task.setdefault("recent_logs", [])
+        logs.append(line)
+        del logs[:-50]
+        now = _now()
+        task["last_output_at"] = now
+        task["updated_at"] = now
+        if task.get("diagnostic") == "PGS 转换长时间没有新输出，可能卡住。":
+            task["diagnostic"] = ""
+
+
+def _set_task_phase(task_id: str, phase: str, message: str) -> None:
+    _update_task(task_id, phase=phase, message=message, phase_started_at=_now(), diagnostic="")
+
+
 def _task_cancel_requested(task_id: str) -> bool:
     with TASK_LOCK:
         return bool(TASKS[task_id].get("cancel_requested"))
@@ -546,6 +565,67 @@ def _task_cmd_text(cmd: list[str]) -> str:
 
 def _trim_task_output(output: str) -> str:
     return output[-4000:] if len(output) > 4000 else output
+
+
+def _task_diagnostic_dir(task_id: str) -> Path:
+    return TASK_DIAGNOSTIC_ROOT / task_id
+
+
+def _task_diagnostic_json_path(task_id: str) -> Path:
+    return _task_diagnostic_dir(task_id) / "diagnostic.json"
+
+
+def _task_log_path(task_id: str) -> Path:
+    return _task_diagnostic_dir(task_id) / "task.log"
+
+
+def _safe_rel_or_abs(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return rel_to_media(path)
+    except ValueError:
+        return str(path)
+
+
+def _write_task_diagnostic(task_id: str, **extra) -> None:
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if task is None:
+            return
+        body = task.get("body") or {}
+        data = {
+            "task_id": task_id,
+            "status": task.get("status"),
+            "phase": task.get("phase"),
+            "error": task.get("error"),
+            "message": task.get("message"),
+            "video": task.get("video"),
+            "subtitle_mode": task.get("subtitle_mode"),
+            "cmd": task.get("cmd"),
+            "pid": task.get("pid"),
+            "created_at": task.get("created_at"),
+            "updated_at": task.get("updated_at"),
+            "phase_started_at": task.get("phase_started_at"),
+            "last_output_at": task.get("last_output_at"),
+            "pgs_work_dir": task.get("pgs_work_dir"),
+            "pgs_input_copy": task.get("pgs_input_copy"),
+            "pgs_converter_version": task.get("pgs_converter_version"),
+            "pgs_options": body.get("pgs_options"),
+            "recent_logs": task.get("recent_logs", []),
+        }
+        data.update(extra)
+    diagnostic_dir = _task_diagnostic_dir(task_id)
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    _task_diagnostic_json_path(task_id).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _pgs_converter_version(tool: str) -> str:
+    try:
+        output = subprocess.check_output([tool, "--version"], stderr=subprocess.STDOUT, timeout=10)
+    except Exception:
+        return "version unavailable"
+    return output.decode(errors="ignore").strip() or "version unavailable"
 
 
 def _video_duration_seconds(video: Path) -> float | None:
@@ -625,11 +705,15 @@ def _run_task_process(
     phase: str,
     progress_key: str,
     progress_parser=None,
+    log_path: Path | None = None,
     timeout: int = 3600,
     complete_percent: int = 100,
 ) -> str:
     cmd_text = _task_cmd_text(cmd)
-    _update_task(task_id, cmd=cmd_text, message=f"正在执行: {phase}")
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(f"$ {cmd_text}\n", encoding="utf-8")
+    _update_task(task_id, cmd=cmd_text, message=f"正在执行: {phase}", phase_started_at=_now(), diagnostic="")
     output_lines = []
     started = _now()
     process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="ignore")
@@ -637,6 +721,7 @@ def _run_task_process(
     threading.Thread(target=_enqueue_process_output, args=(process, output_queue), daemon=True).start()
     with TASK_LOCK:
         TASKS[task_id]["process"] = process
+        TASKS[task_id]["pid"] = process.pid
     try:
         while True:
             if _task_cancel_requested(task_id):
@@ -650,9 +735,19 @@ def _run_task_process(
             except queue.Empty:
                 if process.poll() is not None:
                     break
+                with TASK_LOCK:
+                    task = TASKS[task_id]
+                    last_output_at = task.get("last_output_at") or task.get("phase_started_at") or started
+                    if task.get("phase") == "pgs" and _now() - last_output_at > 300 and not task.get("diagnostic"):
+                        task["diagnostic"] = "PGS 转换长时间没有新输出，可能卡住。"
+                        task["updated_at"] = _now()
                 continue
             line = line.rstrip()
             output_lines.append(line)
+            if log_path is not None:
+                with log_path.open("a", encoding="utf-8") as log_file:
+                    log_file.write(line + "\n")
+            _append_task_log(task_id, line)
             _update_task(task_id, message=line or f"正在执行: {phase}")
             if progress_parser:
                 percent = progress_parser(line)
@@ -704,6 +799,20 @@ def _convert_ass_to_pgs_for_task(
     input_path = input_dir / subtitle_path.name
     shutil.copy2(subtitle_path, input_path)
 
+    diagnostic_dir = _task_diagnostic_dir(task_id)
+    diagnostic_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _task_log_path(task_id)
+    converter_version = _pgs_converter_version(tool)
+    _update_task(
+        task_id,
+        diagnostic_dir=_safe_rel_or_abs(diagnostic_dir),
+        full_log_path=_safe_rel_or_abs(log_path),
+        diagnostic_download_url=f"/api/tasks/{task_id}/diagnostic",
+        pgs_work_dir=_safe_rel_or_abs(work_dir),
+        pgs_input_copy=_safe_rel_or_abs(input_path),
+        pgs_converter_version=converter_version,
+    )
+
     cmd = [
         tool,
         "--enable-pgs-output",
@@ -719,6 +828,16 @@ def _convert_ass_to_pgs_for_task(
         str(work_dir),
     ]
     cmd_text = _task_cmd_text(cmd)
+    _write_task_diagnostic(
+        task_id,
+        subtitle=rel_to_media(subtitle_path),
+        command=cmd_text,
+        converter_version=converter_version,
+        resolution=resolution,
+        framerate=framerate,
+        font_dir=str(font_dir),
+    )
+    success = False
     try:
         def parse_pgs_progress(line: str) -> int | None:
             percent = _parse_percent(line)
@@ -732,6 +851,7 @@ def _convert_ass_to_pgs_for_task(
             phase="PGS 转换",
             progress_key="pgs_progress",
             progress_parser=parse_pgs_progress,
+            log_path=log_path,
             complete_percent=min(100, progress_offset + progress_span),
         )
         candidates = sorted(
@@ -747,9 +867,14 @@ def _convert_ass_to_pgs_for_task(
         target_name = f"{subtitle_path.stem}{output_path.suffix.lower()}"
         target_path = _unique_file_path(subtitle_path.parent, target_name)
         shutil.copy2(output_path, target_path)
+        success = True
+        _write_task_diagnostic(task_id, output=rel_to_media(target_path), conversion_success=True)
         return target_path, cmd_text
     finally:
-        _cleanup_dir(work_dir)
+        if success:
+            _cleanup_dir(work_dir)
+        else:
+            _write_task_diagnostic(task_id, conversion_success=False)
 
 
 def _build_ffmpeg_progress_command(cmd: list[str]) -> list[str]:
@@ -811,7 +936,7 @@ def _run_embed_task(task_id: str) -> None:
         resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
         ass_subtitles = [(sp, meta) for sp, meta in sub_paths if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}]
         if ass_subtitles:
-            _update_task(task_id, phase="pgs", message="开始 PGS 转换")
+            _set_task_phase(task_id, "pgs", "开始 PGS 转换")
             total = len(ass_subtitles)
             done = 0
             for sp, meta in sub_paths:
@@ -843,7 +968,8 @@ def _run_embed_task(task_id: str) -> None:
         has_pgs_subtitle = any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs)
         muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
         warnings = _subtitle_warning_for_existing_pgs(prepared_subs)
-        _update_task(task_id, phase="embed", muxer=muxer, warnings=warnings, message="开始封装")
+        _set_task_phase(task_id, "embed", "开始封装")
+        _update_task(task_id, muxer=muxer, warnings=warnings)
         if muxer == "mkvmerge":
             cmd = _build_mkvmerge_progress_command(_build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing))
             progress_parser = _parse_mkvmerge_progress
@@ -887,8 +1013,10 @@ def _run_embed_task(task_id: str) -> None:
             if out_path is not None and out_path.exists():
                 out_path.unlink()
             _update_task(task_id, status="canceled", phase="canceled", message="任务已取消", error="")
+            _write_task_diagnostic(task_id, canceled=True)
         else:
             _update_task(task_id, status="failed", phase="error", message="任务失败", error=str(exc), cmd=cmd_text, warnings=warnings)
+            _write_task_diagnostic(task_id, failed=True)
 
 
 def _task_worker() -> None:
@@ -944,6 +1072,11 @@ def _create_embed_task(body: dict) -> dict:
         "used_default_output_dir": False,
         "cancel_requested": False,
         "process": None,
+        "pid": None,
+        "phase_started_at": now,
+        "last_output_at": None,
+        "diagnostic": "",
+        "recent_logs": [],
         "body": body,
     }
     with TASK_LOCK:
@@ -1284,6 +1417,32 @@ def api_task(task_id: str):
             return jsonify(error="task not found"), 404
         data = _public_task(task)
     return jsonify(data)
+
+
+@app.route("/api/tasks/<task_id>/diagnostic")
+def api_task_diagnostic(task_id: str):
+    with TASK_LOCK:
+        if task_id not in TASKS:
+            return jsonify(error="task not found"), 404
+    diagnostic_dir = _task_diagnostic_dir(task_id).resolve()
+    diagnostic_root = TASK_DIAGNOSTIC_ROOT.resolve()
+    if diagnostic_root != diagnostic_dir and diagnostic_root not in diagnostic_dir.parents:
+        return jsonify(error="invalid diagnostic path"), 400
+    if not diagnostic_dir.is_dir():
+        return jsonify(error="diagnostic not found"), 404
+
+    zip_path = diagnostic_dir / f"{task_id}.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name in ["diagnostic.json", "task.log"]:
+            path = diagnostic_dir / name
+            if path.is_file():
+                archive.write(path, name)
+        with TASK_LOCK:
+            input_copy = TASKS.get(task_id, {}).get("pgs_input_copy") or ""
+        input_path = safe_path(input_copy) if input_copy and not Path(input_copy).is_absolute() else Path(input_copy)
+        if input_path.is_file():
+            archive.write(input_path, f"input/{input_path.name}")
+    return send_file(zip_path, as_attachment=True, download_name=f"{task_id}-diagnostic.zip")
 
 
 @app.route("/api/tasks/<task_id>/cancel", methods=["POST"])

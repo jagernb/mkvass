@@ -271,6 +271,34 @@ function progressHtml(title, progress) {
   </div>`;
 }
 
+function formatElapsed(seconds) {
+  if (!Number.isFinite(seconds) || seconds < 0) return '-';
+  const minutes = Math.floor(seconds / 60);
+  const rest = Math.floor(seconds % 60);
+  if (minutes < 60) return `${minutes}分${rest}秒`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}小时${minutes % 60}分`;
+}
+
+function taskDiagnosticsHtml(task) {
+  const now = Date.now() / 1000;
+  const startedAt = Number(task.phase_started_at || task.created_at || now);
+  const lastOutputAt = task.last_output_at ? Number(task.last_output_at) : null;
+  const runtime = formatElapsed(now - startedAt);
+  const lastOutput = lastOutputAt ? formatElapsed(now - lastOutputAt) + '前' : '暂无输出';
+  const pid = task.pid ? `PID: ${escapeHtml(task.pid)}` : 'PID: -';
+  const diagnostic = task.diagnostic ? `<div style="color:#ffb947">诊断: ${escapeHtml(task.diagnostic)}</div>` : '';
+  const converter = task.pgs_converter_version ? `<div class="muted">转换器版本: ${escapeHtml(task.pgs_converter_version)}</div>` : '';
+  const pgsInput = task.pgs_input_copy ? `<div class="muted">PGS 输入: ${escapeHtml(task.pgs_input_copy)}</div>` : '';
+  const pgsWorkDir = task.pgs_work_dir ? `<div class="muted">PGS 工作目录: ${escapeHtml(task.pgs_work_dir)}</div>` : '';
+  const download = task.diagnostic_download_url ? `<a class="download-btn" href="${escapeHtml(task.diagnostic_download_url)}">下载诊断包</a><div class="muted">诊断包包含字幕文本、命令和日志，不包含视频。</div>` : '';
+  const cmd = task.cmd ? `<details><summary>完整命令</summary><div class="log">${escapeHtml(task.cmd)}</div></details>` : '';
+  const logs = Array.isArray(task.recent_logs) && task.recent_logs.length
+    ? `<details><summary>最近日志（${task.recent_logs.length} 行）</summary><div class="log">${escapeHtml(task.recent_logs.join('\n'))}</div></details>`
+    : '';
+  return `<div class="muted">${pid} · 当前阶段已运行: ${runtime} · 最后输出: ${lastOutput}</div>${diagnostic}${converter}${pgsInput}${pgsWorkDir}${download}${cmd}${logs}`;
+}
+
 function renderTasks() {
   const box = document.getElementById('taskList');
   if (!box) return;
@@ -299,6 +327,7 @@ function renderTasks() {
         </div>
       </div>
       <div class="muted">${escapeHtml(task.message || '')}</div>
+      ${taskDiagnosticsHtml(task)}
       ${outputText}
       ${warningText}
       ${errorText}
