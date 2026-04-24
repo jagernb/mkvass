@@ -1,7 +1,13 @@
 FROM python:3.12-slim
 
+ARG APP_VERSION=1.0.4
+ARG BUILD_DATE=2026-04-24T00:00:00Z
 ARG MKVTOOL_VERSION=v5.6.4
 ARG TARGETARCH
+
+LABEL org.opencontainers.image.title="mkvass" \
+      org.opencontainers.image.version="${APP_VERSION}" \
+      org.opencontainers.image.created="${BUILD_DATE}"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ffmpeg mkvtoolnix fonts-dejavu-core \
@@ -21,7 +27,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 
-ENV MEDIA_DIR=/media \
+ENV APP_VERSION=${APP_VERSION} \
+    BUILD_DATE=${BUILD_DATE} \
+    MEDIA_DIR=/media \
     HOST=0.0.0.0 \
     PORT=8080 \
     DEFAULT_OUTPUT_DIR= \

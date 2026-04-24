@@ -393,6 +393,7 @@ async function doEmbed(entry) {
     const row = cb.parentElement;
     return {
       path: cb.dataset.path,
+      ext: cb.dataset.ext,
       language: row.querySelector('.embed-lang').value || 'und',
       title: row.querySelector('.embed-title').value || '',
       default: row.querySelector('.embed-default').checked,
@@ -415,6 +416,33 @@ async function doEmbed(entry) {
   const btn = document.getElementById('doEmbed');
   btn.disabled = true;
   try {
+    if (body.subtitle_mode === 'pgs_auto') {
+      const embedSubs = [];
+      for (const sub of subs) {
+        if (['.ass', '.ssa'].includes(sub.ext)) {
+          log.textContent = `正在转换为 PGS: ${sub.path}`;
+          const converted = await api('/api/convert-ass-to-pgs', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              video: entry.path,
+              subtitle: sub.path,
+              pgs_options: body.pgs_options,
+            }),
+          });
+          embedSubs.push({...sub, path: converted.output, ext: subtitleExt(converted.output)});
+        } else {
+          embedSubs.push(sub);
+        }
+      }
+      body.subtitles = embedSubs.map(({ext, ...sub}) => sub);
+      log.textContent = 'PGS 已生成，刷新目录后开始封装...';
+      await loadDir(state.cwd);
+    } else {
+      body.subtitles = subs.map(({ext, ...sub}) => sub);
+    }
+
+    log.textContent = '开始封装（可能较慢，请勿关闭页面）...';
     const res = await api('/api/embed', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
@@ -424,6 +452,7 @@ async function doEmbed(entry) {
     await loadDir(state.cwd);
   } catch (e) {
     log.textContent = '失败: ' + e.message;
+    await loadDir(state.cwd);
   } finally {
     btn.disabled = false;
   }

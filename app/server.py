@@ -30,8 +30,10 @@ PGS_FRAMERATE = (os.environ.get("PGS_FRAMERATE") or os.environ.get("ASS_TO_PGS_F
 PGS_RESOLUTION = (os.environ.get("PGS_RESOLUTION") or os.environ.get("ASS_TO_PGS_RESOLUTION") or "1920*1080").strip() or "1920*1080"
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".ts", ".m4v", ".flv", ".wmv"}
-SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
-DOWNLOADABLE_SUBTITLE_EXTS = SUBTITLE_EXTS | {".sup"}
+TEXT_SUBTITLE_EXTS = {".srt", ".ass", ".ssa", ".vtt", ".sub"}
+PGS_SUBTITLE_EXTS = {".pgs", ".sup"}
+SUBTITLE_EXTS = TEXT_SUBTITLE_EXTS | PGS_SUBTITLE_EXTS
+DOWNLOADABLE_SUBTITLE_EXTS = SUBTITLE_EXTS
 TMP_SUBTITLE_ROOT = MEDIA_DIR / ".tmp_subtitles"
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
@@ -290,6 +292,11 @@ def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, f
     work_dir = Path(tempfile.mkdtemp(prefix="pgs-", dir=temp_root))
     subset_dir = work_dir / "subsetted"
     output_path = subset_dir / f"{subtitle_path.name}.pgs"
+    sibling_outputs_before = {
+        path.resolve()
+        for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*")
+        if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
+    }
 
     cmd = [
         tool,
@@ -312,13 +319,47 @@ def _convert_ass_to_pgs(subtitle_path: Path, *, resolution: str | None = None, f
         raise RuntimeError(exc.output.decode(errors="ignore") or "pgs conversion failed") from exc
 
     if not output_path.exists():
-        candidates = sorted(work_dir.rglob("*.pgs"))
+        work_dir_outputs = [
+            path
+            for path in work_dir.rglob("*")
+            if path.is_file() and path.suffix.lower() in {".pgs", ".sup"}
+        ]
+        sibling_outputs_after = [
+            path
+            for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*")
+            if path.is_file()
+            and path.suffix.lower() in {".pgs", ".sup"}
+            and path.resolve() not in sibling_outputs_before
+        ]
+        candidates = sorted(work_dir_outputs + sibling_outputs_after)
         if candidates:
             output_path = candidates[0]
         else:
-            raise RuntimeError("pgs converter did not produce a .pgs file")
+            produced = sorted(str(path.relative_to(work_dir)) for path in work_dir.rglob("*") if path.is_file())
+            sibling_produced = sorted(path.name for path in subtitle_path.parent.glob(f"{subtitle_path.stem}.*") if path.is_file())
+            detail_items = produced + [f"{subtitle_path.parent.name}/{name}" for name in sibling_produced]
+            detail = f": {', '.join(detail_items)}" if detail_items else ""
+            raise RuntimeError(f"pgs converter did not produce a new .pgs or .sup file{detail}")
 
     return output_path, " ".join(shlex.quote(c) for c in cmd), work_dir
+
+
+def _convert_ass_to_pgs_persistent(subtitle_path: Path, *, resolution: str | None = None, framerate: str | None = None) -> tuple[Path, str]:
+    output_path, cmd_text, work_dir = _convert_ass_to_pgs(
+        subtitle_path,
+        resolution=resolution,
+        framerate=framerate,
+    )
+    try:
+        if output_path.parent.resolve() == subtitle_path.parent.resolve():
+            return output_path, cmd_text
+
+        target_name = f"{subtitle_path.name}{output_path.suffix.lower()}"
+        target_path = _unique_file_path(subtitle_path.parent, target_name)
+        shutil.copy2(output_path, target_path)
+        return target_path, cmd_text
+    finally:
+        _cleanup_dir(work_dir)
 
 
 def _cleanup_dir(path: Path) -> None:
@@ -550,6 +591,60 @@ def api_upload_subtitle():
     })
 
 
+@app.route("/api/convert-ass-to-pgs", methods=["POST"])
+def api_convert_ass_to_pgs():
+    body = request.get_json(silent=True) or {}
+    video_rel = body.get("video", "")
+    subtitle_rel = body.get("subtitle", "")
+
+    try:
+        pgs_options = _validate_pgs_options(_normalize_embed_settings(body)["pgs_options"])
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    try:
+        video = safe_path(video_rel)
+    except ValueError:
+        return jsonify(error="invalid video path"), 400
+    if not video.is_file():
+        return jsonify(error="video not found"), 404
+    if video.suffix.lower() not in VIDEO_EXTS:
+        return jsonify(error="unsupported video type"), 400
+
+    try:
+        subtitle = safe_path(subtitle_rel)
+    except ValueError:
+        return jsonify(error="invalid subtitle path"), 400
+    if not subtitle.is_file():
+        return jsonify(error="subtitle not found"), 404
+    if subtitle.suffix.lower() not in {".ass", ".ssa"}:
+        return jsonify(error="pgs conversion only supports ass/ssa"), 400
+
+    resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
+    try:
+        output_path, conversion_cmd = _convert_ass_to_pgs_persistent(
+            subtitle,
+            resolution=resolved_pgs_resolution,
+            framerate=pgs_options["framerate"],
+        )
+    except (RuntimeError, ValueError) as exc:
+        return jsonify(error=str(exc)), 400
+
+    output_dir = rel_to_media(output_path.parent) if output_path.parent != MEDIA_DIR else ""
+    return jsonify({
+        "ok": True,
+        "input": rel_to_media(subtitle),
+        "output": rel_to_media(output_path),
+        "output_dir": output_dir,
+        "pgs_settings": {
+            "resolution_mode": pgs_options["resolution_mode"],
+            "resolution": resolved_pgs_resolution,
+            "framerate": pgs_options["framerate"],
+        },
+        "cmd": conversion_cmd,
+    })
+
+
 @app.route("/api/embed", methods=["POST"])
 def api_embed():
     body = request.get_json(silent=True) or {}
@@ -602,27 +697,13 @@ def api_embed():
         return jsonify(error=str(exc)), 400
 
     prepared_subs = []
-    conversion_cmds = []
-    conversion_workdirs = []
     success = False
     resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
 
     try:
         for sp, meta in sub_paths:
-            if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}:
-                try:
-                    converted_path, conversion_cmd, work_dir = _convert_ass_to_pgs(
-                        sp,
-                        resolution=resolved_pgs_resolution,
-                        framerate=pgs_options["framerate"],
-                    )
-                except (RuntimeError, ValueError) as exc:
-                    return jsonify(error=str(exc)), 400
-                prepared_subs.append({"path": converted_path, "meta": meta, "codec": "copy"})
-                conversion_cmds.append(conversion_cmd)
-                conversion_workdirs.append(work_dir)
-            else:
-                prepared_subs.append({"path": sp, "meta": meta, "codec": "srt"})
+            codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
+            prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
 
         cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
         for prepared in prepared_subs:
@@ -662,7 +743,7 @@ def api_embed():
         try:
             subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)
         except subprocess.CalledProcessError as exc:
-            return jsonify(error="ffmpeg failed", cmd="\n".join(conversion_cmds + [" ".join(shlex.quote(c) for c in cmd)]),
+            return jsonify(error="ffmpeg failed", cmd=" ".join(shlex.quote(c) for c in cmd),
                            detail=exc.output.decode(errors="ignore")), 500
 
         success = True
@@ -678,11 +759,9 @@ def api_embed():
                 "resolution": resolved_pgs_resolution,
                 "framerate": pgs_options["framerate"],
             },
-            "cmd": "\n".join(conversion_cmds + [" ".join(shlex.quote(c) for c in cmd)]),
+            "cmd": " ".join(shlex.quote(c) for c in cmd),
         })
     finally:
-        for work_dir in conversion_workdirs:
-            _cleanup_dir(work_dir)
         if success:
             for temp_file in temp_files_to_cleanup:
                 if temp_file.exists():

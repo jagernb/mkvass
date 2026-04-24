@@ -46,6 +46,7 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn("resolution_mode: document.getElementById('pgsResolutionMode').value", self.html)
         self.assertIn("resolution: document.getElementById('pgsResolution').value", self.html)
         self.assertIn("framerate: document.getElementById('pgsFramerate').value", self.html)
+        self.assertIn("ext: cb.dataset.ext", self.html)
 
     def test_embed_settings_state_updates_with_mode_changes(self):
         self.assertIn("function updateEmbedSettingsState()", self.html)
@@ -59,6 +60,18 @@ class FrontendUiTests(unittest.TestCase):
         self.assertIn("document.getElementById('subtitleMode').onchange = updateEmbedSettingsState", self.html)
         self.assertIn("document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState", self.html)
         self.assertIn("cb.onchange = updateEmbedSettingsState", self.html)
+
+    def test_pgs_mode_converts_refreshes_then_embeds(self):
+        self.assertIn("body.subtitle_mode === 'pgs_auto'", self.html)
+        self.assertIn("/api/convert-ass-to-pgs", self.html)
+        self.assertIn("path: converted.output", self.html)
+        self.assertIn("PGS 已生成，刷新目录后开始封装", self.html)
+        self.assertIn("body.subtitles = embedSubs.map(({ext, ...sub}) => sub)", self.html)
+        self.assertIn("await loadDir(state.cwd);\n    } else {", self.html)
+        self.assertIn("开始封装（可能较慢，请勿关闭页面）", self.html)
+
+    def test_embed_refreshes_directory_after_failure(self):
+        self.assertIn("log.textContent = '失败: ' + e.message;\n    await loadDir(state.cwd);", self.html)
 
 
 if __name__ == "__main__":
