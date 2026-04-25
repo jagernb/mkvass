@@ -223,10 +223,13 @@ async function onClickEntry(e, li) {
   if (e.role === 'video') {
     state.selected = e;
     await showVideo(e);
+  } else if (e.role === 'subtitle') {
+    state.selected = e;
+    showSubtitle(e);
   } else {
     document.getElementById('content').style.display = 'none';
     document.getElementById('empty').style.display = '';
-    document.getElementById('empty').textContent = '仅支持视频文件的字幕操作。';
+    document.getElementById('empty').textContent = '请选择视频或字幕文件。';
   }
 }
 
@@ -254,6 +257,14 @@ function subtitleExt(path) {
 
 function basename(path) {
   return String(path || '').split(/[\\/]/).pop() || path || '';
+}
+
+function standalonePgsDefaults() {
+  return {
+    resolution: '1920*1080',
+    framerate: '23.976',
+    resolution_mode: 'custom',
+  };
 }
 
 function taskStatusText(status) {
@@ -368,7 +379,7 @@ function renderTasks() {
     return `<div class="task-card${statusClass}">
       <div class="task-grid">
         <div>
-          <strong>${escapeHtml(basename(task.video))}</strong>
+          <strong>${escapeHtml(basename(task.video || task.subtitle || task.output))}</strong>
           <div class="muted">${taskTypeText(task.type)} · ${taskStatusText(task.status)} · ${taskPhaseText(task.phase)} · ${escapeHtml(task.message || '')}</div>
         </div>
         ${primaryProgress}
@@ -434,6 +445,92 @@ async function clearCanceledTasks() {
     await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
   }
   await loadTasks();
+}
+
+function showSubtitle(entry) {
+  document.getElementById('empty').style.display = 'none';
+  const c = document.getElementById('content');
+  c.style.display = '';
+  const ext = subtitleExt(entry.name || entry.path);
+  const supportsPgs = ['.ass', '.ssa'].includes(ext);
+  const pgsDefaults = standalonePgsDefaults();
+  const conversionHtml = supportsPgs ? `
+    <section>
+      <h2>单独转换为 PGS</h2>
+      <div class="settings-panel">
+        <div class="row">
+          <label>PGS 尺寸
+            <select id="standalonePgsResolutionMode">
+              <option value="video">使用环境默认</option>
+              <option value="custom" selected>自定义</option>
+            </select>
+          </label>
+          <input type="text" id="standalonePgsResolution" value="${escapeHtml(pgsDefaults.resolution)}" placeholder="如 1920*1080">
+          <input type="text" id="standalonePgsFramerate" value="${escapeHtml(pgsDefaults.framerate)}" placeholder="帧率，如 23.976" style="width:150px">
+          <span class="muted">没有视频可探测时，“使用环境默认”会使用后端默认 PGS 尺寸。</span>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button id="doStandalonePgs">转换为 PGS</button>
+      </div>
+      <div class="log" id="standalonePgsLog" style="display:none"></div>
+    </section>` : `
+    <section>
+      <h2>单独转换为 PGS</h2>
+      <div class="muted">仅 ASS/SSA 支持转换为 PGS。</div>
+    </section>`;
+
+  c.innerHTML = `
+    <section>
+      <h2>字幕文件信息</h2>
+      <div class="muted">${escapeHtml(entry.path)}</div>
+      <div class="row" style="margin-top:6px">
+        <span class="pill">${bytes(entry.size)}</span>
+        <span class="pill">扩展名: ${escapeHtml(ext || '-')}</span>
+      </div>
+    </section>
+    ${conversionHtml}
+  `;
+  if (supportsPgs) {
+    document.getElementById('standalonePgsResolutionMode').onchange = updateStandalonePgsState;
+    document.getElementById('doStandalonePgs').onclick = () => doStandalonePgs(entry);
+    updateStandalonePgsState();
+  }
+}
+
+function updateStandalonePgsState() {
+  const mode = document.getElementById('standalonePgsResolutionMode');
+  const resolution = document.getElementById('standalonePgsResolution');
+  if (!mode || !resolution) return;
+  resolution.disabled = mode.value !== 'custom';
+}
+
+async function doStandalonePgs(entry) {
+  const log = document.getElementById('standalonePgsLog');
+  const btn = document.getElementById('doStandalonePgs');
+  log.style.display = '';
+  log.textContent = '正在添加 PGS 转换任务...';
+  btn.disabled = true;
+  try {
+    const res = await api('/api/tasks/pgs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        subtitle: entry.path,
+        pgs_options: {
+          resolution_mode: document.getElementById('standalonePgsResolutionMode').value,
+          resolution: document.getElementById('standalonePgsResolution').value,
+          framerate: document.getElementById('standalonePgsFramerate').value,
+        },
+      }),
+    });
+    log.textContent = `任务已添加: ${res.task.id}\n转换完成后会输出到原字幕同目录，可继续切换目录添加其他任务。`;
+    await loadTasks();
+  } catch (e) {
+    log.textContent = '失败: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 function renderDetail(entry, probe) {

@@ -1111,6 +1111,28 @@ def _prepare_embed_task(body: dict) -> tuple[Path, list[tuple[Path, dict]], Path
     return video, sub_paths, out_path, pgs_options, use_default_output_dir, subtitle_mode
 
 
+def _prepare_pgs_only_task(body: dict) -> tuple[Path, dict]:
+    subtitle_rel = body.get("subtitle")
+    if not subtitle_rel:
+        raise ValueError("subtitle required")
+
+    embed_settings = _normalize_embed_settings(body)
+    pgs_options = _validate_pgs_options(embed_settings["pgs_options"])
+
+    subtitle = safe_path(subtitle_rel)
+    if not subtitle.is_file():
+        raise FileNotFoundError("subtitle not found")
+    if subtitle.suffix.lower() not in {".ass", ".ssa"}:
+        raise ValueError("pgs conversion only supports ass/ssa")
+    return subtitle, pgs_options
+
+
+def _derive_standalone_pgs_resolution(pgs_options: dict) -> str:
+    if pgs_options["resolution_mode"] == "custom":
+        return pgs_options["resolution"]
+    return PGS_RESOLUTION
+
+
 def _run_embed_task(task_id: str) -> None:
     with TASK_LOCK:
         body = TASKS[task_id]["body"]
@@ -1244,7 +1266,44 @@ def _run_pgs_task(task_id: str) -> None:
         body = TASKS[task_id]["body"]
     converted = []
     cmd_text = ""
+    standalone = bool(body.get("subtitle")) and not body.get("video")
     try:
+        if standalone:
+            subtitle, pgs_options = _prepare_pgs_only_task(body)
+            resolved_pgs_resolution = _derive_standalone_pgs_resolution(pgs_options)
+            source_path = rel_to_media(subtitle)
+            _set_task_phase(task_id, "pgs", "开始 PGS 转换")
+            _set_task_progress(task_id, "pgs_progress", 0, f"正在转换: {source_path}", True)
+            converted_path, cmd_text = _convert_ass_to_pgs_for_task(
+                task_id,
+                subtitle,
+                resolution=resolved_pgs_resolution,
+                framerate=pgs_options["framerate"],
+            )
+            converted_rel = rel_to_media(converted_path)
+            converted = [{"source_path": source_path, "path": converted_rel}]
+            output_dir = rel_to_media(converted_path.parent) if converted_path.parent != MEDIA_DIR else ""
+            _set_task_progress(task_id, "pgs_progress", 100, f"已转换: {converted_rel}", False)
+            _update_task(
+                task_id,
+                status="succeeded",
+                phase="done",
+                output=converted_rel,
+                output_dir=output_dir,
+                subtitle_mode="pgs_auto",
+                converted_subtitles=converted,
+                pgs_settings={
+                    "resolution_mode": pgs_options["resolution_mode"],
+                    "resolution": resolved_pgs_resolution,
+                    "framerate": pgs_options["framerate"],
+                    "applies_to": "standalone_ass_to_pgs_conversion",
+                    "applied_to_existing_pgs": False,
+                },
+                cmd=cmd_text,
+                message="PGS 转换完成",
+            )
+            return
+
         video, sub_paths, _out_path, pgs_options, use_default_output_dir, _subtitle_mode = _prepare_embed_task(body)
         resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
         ass_subtitles = [(sp, meta) for sp, meta in sub_paths if sp.suffix.lower() in {".ass", ".ssa"}]
@@ -1297,11 +1356,13 @@ def _run_pgs_task(task_id: str) -> None:
     except Exception as exc:
         if _task_cancel_requested(task_id) or str(exc) == "task canceled":
             _update_task(task_id, status="canceled", phase="canceled", message="PGS 转换已取消", error="")
-            _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换已取消，已跳过封装")
+            if not standalone:
+                _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换已取消，已跳过封装")
             _write_task_diagnostic(task_id, canceled=True)
         else:
             _update_task(task_id, status="failed", phase="error", message="PGS 转换失败", error=str(exc), cmd=cmd_text)
-            _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换失败，已跳过封装", error=str(exc))
+            if not standalone:
+                _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换失败，已跳过封装", error=str(exc))
             _write_task_diagnostic(task_id, failed=True)
 
 
@@ -1348,6 +1409,7 @@ def _base_task(body: dict, task_type: str, *, phase: str = "queued", message: st
         "status": "pending",
         "phase": phase,
         "video": body.get("video") or "",
+        "subtitle": body.get("subtitle") or "",
         "out_name": body.get("out_name") or "",
         "output": "",
         "output_dir": "",
@@ -1410,6 +1472,16 @@ def _create_embed_task_chain(body: dict) -> list[dict]:
         TASK_EVENT.set()
     _ensure_task_worker()
     return [pgs_task, embed_task]
+
+
+def _create_pgs_only_task(body: dict) -> dict:
+    task = _base_task(body, "pgs", message="等待 PGS 转换")
+    with TASK_LOCK:
+        TASKS[task["id"]] = task
+        TASK_QUEUE.append(task["id"])
+        TASK_EVENT.set()
+    _ensure_task_worker()
+    return task
 
 
 @app.route("/")
@@ -1717,6 +1789,20 @@ def api_create_embed_task():
     tasks = _create_embed_task_chain(body)
     public_tasks = [_public_task(task) for task in tasks]
     return jsonify({"ok": True, "task": public_tasks[0], "tasks": public_tasks}), 202
+
+
+@app.route("/api/tasks/pgs", methods=["POST"])
+def api_create_pgs_task():
+    body = request.get_json(silent=True) or {}
+    try:
+        _prepare_pgs_only_task(body)
+    except FileNotFoundError as exc:
+        return jsonify(error=str(exc)), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    task = _create_pgs_only_task(body)
+    return jsonify({"ok": True, "task": _public_task(task)}), 202
 
 
 @app.route("/api/tasks")
