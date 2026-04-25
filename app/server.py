@@ -1125,36 +1125,10 @@ def _run_embed_task(task_id: str) -> None:
         video, sub_paths, out_path, pgs_options, use_default_output_dir, subtitle_mode = _prepare_embed_task(body)
         temp_files_to_cleanup = [sp for sp, _meta in sub_paths if _is_temp_subtitle(sp, video)]
         resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
-        ass_subtitles = [(sp, meta) for sp, meta in sub_paths if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}]
-        if ass_subtitles:
-            _set_task_phase(task_id, "pgs", "开始 PGS 转换")
-            total = len(ass_subtitles)
-            done = 0
-            for sp, meta in sub_paths:
-                if _task_cancel_requested(task_id):
-                    raise RuntimeError("task canceled")
-                if subtitle_mode == "pgs_auto" and sp.suffix.lower() in {".ass", ".ssa"}:
-                    base_percent = int(done / total * 100)
-                    _set_task_progress(task_id, "pgs_progress", base_percent, f"正在转换: {rel_to_media(sp)}", True)
-                    converted_path, cmd_text = _convert_ass_to_pgs_for_task(
-                        task_id,
-                        sp,
-                        resolution=resolved_pgs_resolution,
-                        framerate=pgs_options["framerate"],
-                        progress_offset=base_percent,
-                        progress_span=int(100 / total),
-                    )
-                    done += 1
-                    _set_task_progress(task_id, "pgs_progress", int(done / total * 100), f"已转换: {rel_to_media(converted_path)}", True)
-                    prepared_subs.append({"path": converted_path, "meta": meta, "codec": "copy"})
-                else:
-                    codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
-                    prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
-        else:
-            _set_task_progress(task_id, "pgs_progress", 100, "无需 PGS 转换", False)
-            for sp, meta in sub_paths:
-                codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
-                prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
+        _set_task_progress(task_id, "pgs_progress", 100, "PGS 转换任务已分离", False)
+        for sp, meta in sub_paths:
+            codec = "copy" if sp.suffix.lower() in PGS_SUBTITLE_EXTS else "srt"
+            prepared_subs.append({"path": sp, "meta": meta, "codec": codec})
 
         has_pgs_subtitle = any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs)
         muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
@@ -1211,6 +1185,126 @@ def _run_embed_task(task_id: str) -> None:
             _write_task_diagnostic(task_id, failed=True)
 
 
+def _replace_converted_subtitle_paths(body: dict, converted: list[dict]) -> dict:
+    next_body = json.loads(json.dumps(body, ensure_ascii=False))
+    replacements = {item["source_path"]: item["path"] for item in converted}
+    for sub in next_body.get("subtitles") or []:
+        path = sub.get("path")
+        if path in replacements:
+            sub["converted_from"] = path
+            sub["path"] = replacements[path]
+    tracks = next_body.get("tracks") if isinstance(next_body.get("tracks"), dict) else None
+    if tracks:
+        for track in tracks.get("subtitle") or []:
+            if not isinstance(track, dict) or track.get("source") != "external":
+                continue
+            path = track.get("path")
+            if path in replacements:
+                track["converted_from"] = path
+                track["path"] = replacements[path]
+    next_body["subtitle_mode"] = "text"
+    return next_body
+
+
+def _find_dependent_embed_task(task_id: str) -> str | None:
+    with TASK_LOCK:
+        direct_id = TASKS.get(task_id, {}).get("dependent_task_id")
+        if direct_id and direct_id in TASKS:
+            return direct_id
+        for candidate_id, task in TASKS.items():
+            if task.get("depends_on") == task_id and task.get("type") == "embed":
+                return candidate_id
+    return None
+
+
+def _finish_dependent_embed_task(task_id: str, *, status: str, message: str, error: str = "") -> None:
+    dependent_id = _find_dependent_embed_task(task_id)
+    if dependent_id:
+        _update_task(dependent_id, status=status, phase="canceled", message=message, error=error)
+
+
+def _enqueue_dependent_embed_task(task_id: str, body: dict) -> None:
+    dependent_id = _find_dependent_embed_task(task_id)
+    if not dependent_id:
+        return
+    with TASK_LOCK:
+        task = TASKS[dependent_id]
+        task["body"] = body
+        task["subtitle_mode"] = body.get("subtitle_mode") or "text"
+        task["message"] = "等待封装"
+        task["phase"] = "queued"
+        task["updated_at"] = _now()
+        if task["status"] == "pending" and dependent_id not in TASK_QUEUE:
+            TASK_QUEUE.append(dependent_id)
+            TASK_EVENT.set()
+
+
+def _run_pgs_task(task_id: str) -> None:
+    with TASK_LOCK:
+        body = TASKS[task_id]["body"]
+    converted = []
+    cmd_text = ""
+    try:
+        video, sub_paths, _out_path, pgs_options, use_default_output_dir, _subtitle_mode = _prepare_embed_task(body)
+        resolved_pgs_resolution = _derive_pgs_resolution(video, pgs_options)
+        ass_subtitles = [(sp, meta) for sp, meta in sub_paths if sp.suffix.lower() in {".ass", ".ssa"}]
+        total = len(ass_subtitles)
+        if not total:
+            raise RuntimeError("no ass/ssa subtitles to convert")
+        _set_task_phase(task_id, "pgs", "开始 PGS 转换")
+        done = 0
+        for sp, _meta in ass_subtitles:
+            if _task_cancel_requested(task_id):
+                raise RuntimeError("task canceled")
+            source_path = rel_to_media(sp)
+            base_percent = int(done / total * 100)
+            _set_task_progress(task_id, "pgs_progress", base_percent, f"正在转换: {source_path}", True)
+            converted_path, cmd_text = _convert_ass_to_pgs_for_task(
+                task_id,
+                sp,
+                resolution=resolved_pgs_resolution,
+                framerate=pgs_options["framerate"],
+                progress_offset=base_percent,
+                progress_span=int(100 / total),
+            )
+            done += 1
+            converted_rel = rel_to_media(converted_path)
+            converted.append({"source_path": source_path, "path": converted_rel})
+            _set_task_progress(task_id, "pgs_progress", int(done / total * 100), f"已转换: {converted_rel}", True)
+
+        next_body = _replace_converted_subtitle_paths(body, converted)
+        _enqueue_dependent_embed_task(task_id, next_body)
+        output = converted[0]["path"] if len(converted) == 1 else f"已转换 {len(converted)} 个字幕"
+        _update_task(
+            task_id,
+            status="succeeded",
+            phase="done",
+            output=output,
+            output_dir="",
+            subtitle_mode="pgs_auto",
+            used_default_output_dir=use_default_output_dir,
+            converted_subtitles=converted,
+            pgs_settings={
+                "resolution_mode": pgs_options["resolution_mode"],
+                "resolution": resolved_pgs_resolution,
+                "framerate": pgs_options["framerate"],
+                "applies_to": "ass_to_pgs_conversion_only",
+                "applied_to_existing_pgs": False,
+            },
+            cmd=cmd_text,
+            message="PGS 转换完成，已加入封装任务",
+        )
+    except Exception as exc:
+        if _task_cancel_requested(task_id) or str(exc) == "task canceled":
+            _update_task(task_id, status="canceled", phase="canceled", message="PGS 转换已取消", error="")
+            _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换已取消，已跳过封装")
+            _write_task_diagnostic(task_id, canceled=True)
+        else:
+            _update_task(task_id, status="failed", phase="error", message="PGS 转换失败", error=str(exc), cmd=cmd_text)
+            _finish_dependent_embed_task(task_id, status="canceled", message="PGS 转换失败，已跳过封装", error=str(exc))
+            _write_task_diagnostic(task_id, failed=True)
+
+
 def _task_worker() -> None:
     while True:
         TASK_EVENT.wait()
@@ -1226,7 +1320,11 @@ def _task_worker() -> None:
                 task["status"] = "running"
                 task["phase"] = "queued"
                 task["updated_at"] = _now()
-            _run_embed_task(task_id)
+                task_type = task.get("type")
+            if task_type == "pgs":
+                _run_pgs_task(task_id)
+            else:
+                _run_embed_task(task_id)
 
 
 def _ensure_task_worker() -> None:
@@ -1238,16 +1336,17 @@ def _ensure_task_worker() -> None:
     threading.Thread(target=_task_worker, daemon=True, name="subtitle-task-worker").start()
 
 
-def _create_embed_task(body: dict) -> dict:
+def _base_task(body: dict, task_type: str, *, phase: str = "queued", message: str = "等待执行", depends_on: str = "") -> dict:
     task_id = uuid.uuid4().hex
     now = _now()
-    task = {
+    return {
         "id": task_id,
-        "type": "embed",
+        "type": task_type,
+        "depends_on": depends_on,
         "created_at": now,
         "updated_at": now,
         "status": "pending",
-        "phase": "queued",
+        "phase": phase,
         "video": body.get("video") or "",
         "out_name": body.get("out_name") or "",
         "output": "",
@@ -1255,12 +1354,13 @@ def _create_embed_task(body: dict) -> dict:
         "subtitle_mode": body.get("subtitle_mode") or "text",
         "pgs_progress": _progress(0, "等待 PGS 转换", False),
         "embed_progress": _progress(0, "等待封装", False),
-        "message": "等待执行",
+        "message": message,
         "cmd": "",
         "error": "",
         "warnings": [],
         "muxer": "",
         "pgs_settings": None,
+        "converted_subtitles": [],
         "used_default_output_dir": False,
         "cancel_requested": False,
         "process": None,
@@ -1271,12 +1371,45 @@ def _create_embed_task(body: dict) -> dict:
         "recent_logs": [],
         "body": body,
     }
+
+
+def _body_needs_pgs_task(body: dict) -> bool:
+    if (body.get("subtitle_mode") or "text") != "pgs_auto":
+        return False
+    for sub in body.get("subtitles") or []:
+        try:
+            path = safe_path(sub.get("path", ""))
+        except ValueError:
+            continue
+        if path.suffix.lower() in {".ass", ".ssa"}:
+            return True
+    return False
+
+
+def _create_embed_task(body: dict) -> dict:
+    task = _base_task(body, "embed")
     with TASK_LOCK:
-        TASKS[task_id] = task
-        TASK_QUEUE.append(task_id)
+        TASKS[task["id"]] = task
+        TASK_QUEUE.append(task["id"])
         TASK_EVENT.set()
     _ensure_task_worker()
     return task
+
+
+def _create_embed_task_chain(body: dict) -> list[dict]:
+    if not _body_needs_pgs_task(body):
+        return [_create_embed_task(body)]
+
+    pgs_task = _base_task(body, "pgs", message="等待 PGS 转换")
+    embed_task = _base_task(body, "embed", phase="waiting_pgs", message="等待 PGS 转换完成", depends_on=pgs_task["id"])
+    pgs_task["dependent_task_id"] = embed_task["id"]
+    with TASK_LOCK:
+        TASKS[pgs_task["id"]] = pgs_task
+        TASKS[embed_task["id"]] = embed_task
+        TASK_QUEUE.append(pgs_task["id"])
+        TASK_EVENT.set()
+    _ensure_task_worker()
+    return [pgs_task, embed_task]
 
 
 @app.route("/")
@@ -1581,8 +1714,9 @@ def api_create_embed_task():
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
-    task = _create_embed_task(body)
-    return jsonify({"ok": True, "task": _public_task(task)}), 202
+    tasks = _create_embed_task_chain(body)
+    public_tasks = [_public_task(task) for task in tasks]
+    return jsonify({"ok": True, "task": public_tasks[0], "tasks": public_tasks}), 202
 
 
 @app.route("/api/tasks")

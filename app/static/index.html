@@ -270,12 +270,20 @@ function taskStatusText(status) {
 function taskPhaseText(phase) {
   return {
     queued: '排队',
+    waiting_pgs: '等待 PGS 转换',
     pgs: 'PGS 转换',
     embed: '封装',
     done: '完成',
     error: '失败',
     canceled: '已取消',
   }[phase] || phase || '';
+}
+
+function taskTypeText(type) {
+  return {
+    pgs: 'PGS 转换任务',
+    embed: '封装任务',
+  }[type] || '任务';
 }
 
 function progressHtml(title, progress) {
@@ -354,14 +362,17 @@ function renderTasks() {
     const errorText = task.error ? `<div style="color:#f66">${escapeHtml(task.error)}</div>` : '';
     const outputText = task.output ? `<div class="muted">输出: ${escapeHtml(task.output)}</div>` : '';
     const detailHtml = `${taskDiagnosticsHtml(task)}${outputText}${warningText}${errorText}`;
+    const primaryProgress = task.type === 'pgs'
+      ? progressHtml('PGS', task.pgs_progress)
+      : progressHtml('封装', task.embed_progress);
     return `<div class="task-card${statusClass}">
       <div class="task-grid">
         <div>
           <strong>${escapeHtml(basename(task.video))}</strong>
-          <div class="muted">${taskStatusText(task.status)} · ${taskPhaseText(task.phase)} · ${escapeHtml(task.message || '')}</div>
+          <div class="muted">${taskTypeText(task.type)} · ${taskStatusText(task.status)} · ${taskPhaseText(task.phase)} · ${escapeHtml(task.message || '')}</div>
         </div>
-        ${progressHtml('PGS', task.pgs_progress)}
-        ${progressHtml('封装', task.embed_progress)}
+        ${primaryProgress}
+        <div class="muted">${task.depends_on ? '依赖: ' + escapeHtml(task.depends_on.slice(0, 8)) : ''}</div>
         <div class="row">
           ${canCancel ? `<button class="secondary" data-cancel-task="${escapeHtml(task.id)}" ${task.status === 'canceling' ? 'disabled' : ''}>取消</button>` : ''}
           ${canDelete ? `<button class="secondary" data-delete-task="${escapeHtml(task.id)}">清除</button>` : ''}
@@ -763,7 +774,10 @@ async function doEmbed(entry) {
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
     });
-    log.textContent = `任务已添加: ${res.task.id}\n可继续切换目录添加其他任务，后台会按添加顺序执行。`;
+    const tasks = res.tasks || (res.task ? [res.task] : []);
+    log.textContent = tasks.length > 1
+      ? `已添加 ${tasks.length} 个任务：PGS 转换和封装将分开执行。\n可继续切换目录添加其他任务，后台会按添加顺序执行。`
+      : `任务已添加: ${res.task.id}\n可继续切换目录添加其他任务，后台会按添加顺序执行。`;
     await loadTasks();
   } catch (e) {
     const errorParts = ['失败: ' + e.message];
