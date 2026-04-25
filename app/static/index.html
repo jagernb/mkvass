@@ -52,12 +52,15 @@
                   padding: 6px 14px; border-radius: 6px; font-size: 13px; font-weight: 600; }
   .tag.temp { background: #7c4dff33; color: #c9b3ff; }
   .browser-actions { padding: 10px 14px; border-bottom: 1px solid #1a1d24; background: #11141b; }
-  .task-card { border: 1px solid #222; border-radius: 8px; padding: 10px; margin-top: 8px; background: #11141b; }
+  .task-card { border: 1px solid #222; border-radius: 8px; padding: 8px 10px; margin-top: 8px; background: #11141b; }
   .task-card.done { border-color: #00b37655; }
   .task-card.failed { border-color: #ff5c5c66; }
-  .progress { width: 180px; height: 8px; background: #252a35; border-radius: 999px; overflow: hidden; }
+  .task-card.canceled { border-color: #666; opacity: .78; }
+  .progress { width: 160px; height: 8px; background: #252a35; border-radius: 999px; overflow: hidden; }
   .progress-bar { height: 100%; background: #2b64ff; width: 0%; transition: width .2s ease; }
-  .task-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px; align-items: center; }
+  .task-grid { display: grid; grid-template-columns: minmax(220px, 1.5fr) minmax(180px, 1fr) minmax(180px, 1fr) auto; gap: 8px; align-items: center; }
+  .task-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .task-toolbar h2 { margin-right: auto; }
 </style>
 </head>
 <body>
@@ -77,7 +80,21 @@
   </div>
   <div id="detail">
     <section id="taskPanel">
-      <h2>当前任务</h2>
+      <div class="task-toolbar">
+        <h2 id="taskPanelTitle">当前任务</h2>
+        <button id="toggleTaskPanel" class="secondary">收起</button>
+        <label class="muted">筛选
+          <select id="taskFilter">
+            <option value="active">进行中</option>
+            <option value="all">全部</option>
+            <option value="failed">失败</option>
+            <option value="succeeded">完成</option>
+            <option value="canceled">已取消</option>
+          </select>
+        </label>
+        <label class="muted"><input type="checkbox" id="hideCanceledTasks" checked> 隐藏已取消</label>
+        <button id="clearCanceledTasks" class="secondary">清除已取消</button>
+      </div>
       <div id="taskList" class="muted">暂无任务</div>
     </section>
     <div id="empty" class="muted">选择一个视频文件查看字幕轨道。</div>
@@ -86,7 +103,7 @@
 </main>
 
 <script>
-let state = { cwd: '', entries: [], selected: null, probe: null, tasks: [], taskStatuses: {} };
+let state = { cwd: '', entries: [], selected: null, probe: null, tasks: [], taskStatuses: {}, taskPanelCollapsed: false, taskFilter: 'active', hideCanceled: true };
 
 async function api(path, opts={}) {
   const res = await fetch(path, opts);
@@ -299,42 +316,65 @@ function taskDiagnosticsHtml(task) {
   return `<div class="muted">${pid} · 当前阶段已运行: ${runtime} · 最后输出: ${lastOutput}</div>${diagnostic}${converter}${pgsInput}${pgsWorkDir}${download}${cmd}${logs}`;
 }
 
+function filteredTasks() {
+  const activeStatuses = new Set(['pending', 'running', 'canceling']);
+  return state.tasks.filter(task => {
+    if (state.hideCanceled && task.status === 'canceled') return false;
+    if (state.taskFilter === 'active') return activeStatuses.has(task.status);
+    if (state.taskFilter === 'all') return true;
+    return task.status === state.taskFilter;
+  });
+}
+
 function renderTasks() {
   const box = document.getElementById('taskList');
+  const title = document.getElementById('taskPanelTitle');
+  const toggle = document.getElementById('toggleTaskPanel');
   if (!box) return;
-  if (!state.tasks.length) {
+  const visibleTasks = filteredTasks();
+  const activeCount = state.tasks.filter(task => ['pending', 'running', 'canceling'].includes(task.status)).length;
+  if (title) title.textContent = `当前任务（进行中 ${activeCount} / 总数 ${state.tasks.length}）`;
+  if (toggle) toggle.textContent = state.taskPanelCollapsed ? '展开' : '收起';
+  if (state.taskPanelCollapsed) {
     box.className = 'muted';
-    box.textContent = '暂无任务';
+    box.textContent = activeCount ? `已收起，${activeCount} 个任务进行中` : '已收起，暂无进行中任务';
+    return;
+  }
+  if (!visibleTasks.length) {
+    box.className = 'muted';
+    box.textContent = state.tasks.length ? '当前筛选下暂无任务' : '暂无任务';
     return;
   }
   box.className = '';
-  box.innerHTML = state.tasks.map(task => {
-    const doneClass = task.status === 'succeeded' ? ' done' : task.status === 'failed' ? ' failed' : '';
+  box.innerHTML = visibleTasks.map(task => {
+    const statusClass = task.status === 'succeeded' ? ' done' : task.status === 'failed' ? ' failed' : task.status === 'canceled' ? ' canceled' : '';
     const canCancel = ['pending', 'running', 'canceling'].includes(task.status);
+    const canDelete = ['succeeded', 'failed', 'canceled'].includes(task.status);
     const warningText = Array.isArray(task.warnings) && task.warnings.length ? `<div class="muted">警告: ${escapeHtml(task.warnings.join('；'))}</div>` : '';
     const errorText = task.error ? `<div style="color:#f66">${escapeHtml(task.error)}</div>` : '';
     const outputText = task.output ? `<div class="muted">输出: ${escapeHtml(task.output)}</div>` : '';
-    return `<div class="task-card${doneClass}">
+    const detailHtml = `${taskDiagnosticsHtml(task)}${outputText}${warningText}${errorText}`;
+    return `<div class="task-card${statusClass}">
       <div class="task-grid">
         <div>
           <strong>${escapeHtml(basename(task.video))}</strong>
-          <div class="muted">${taskStatusText(task.status)} · ${taskPhaseText(task.phase)}</div>
+          <div class="muted">${taskStatusText(task.status)} · ${taskPhaseText(task.phase)} · ${escapeHtml(task.message || '')}</div>
         </div>
         ${progressHtml('PGS', task.pgs_progress)}
         ${progressHtml('封装', task.embed_progress)}
         <div class="row">
           ${canCancel ? `<button class="secondary" data-cancel-task="${escapeHtml(task.id)}" ${task.status === 'canceling' ? 'disabled' : ''}>取消</button>` : ''}
+          ${canDelete ? `<button class="secondary" data-delete-task="${escapeHtml(task.id)}">清除</button>` : ''}
         </div>
       </div>
-      <div class="muted">${escapeHtml(task.message || '')}</div>
-      ${taskDiagnosticsHtml(task)}
-      ${outputText}
-      ${warningText}
-      ${errorText}
+      <details><summary class="muted">详情 / 诊断</summary>${detailHtml}</details>
     </div>`;
   }).join('');
   box.querySelectorAll('[data-cancel-task]').forEach(btn => {
     btn.onclick = () => cancelTask(btn.dataset.cancelTask);
+  });
+  box.querySelectorAll('[data-delete-task]').forEach(btn => {
+    btn.onclick = () => deleteTask(btn.dataset.deleteTask);
   });
 }
 
@@ -362,33 +402,68 @@ async function loadTasks() {
 }
 
 async function cancelTask(taskId) {
-  await api(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+  const res = await api(`/api/tasks/${taskId}/cancel`, { method: 'POST' });
+  if (state.hideCanceled && res.task?.status === 'canceled') {
+    state.tasks = state.tasks.filter(task => task.id !== taskId);
+    renderTasks();
+  }
+  await loadTasks();
+}
+
+async function deleteTask(taskId) {
+  await api(`/api/tasks/${taskId}`, { method: 'DELETE' });
+  state.tasks = state.tasks.filter(task => task.id !== taskId);
+  renderTasks();
+  await loadTasks();
+}
+
+async function clearCanceledTasks() {
+  const canceled = state.tasks.filter(task => task.status === 'canceled');
+  for (const task of canceled) {
+    await api(`/api/tasks/${task.id}`, { method: 'DELETE' });
+  }
   await loadTasks();
 }
 
 function renderDetail(entry, probe) {
   const c = document.getElementById('content');
+  const audios = probe.audios || [];
   const subs = probe.subtitles || [];
 
   const siblingSubs = state.entries.filter(e => e.role === 'subtitle');
   const uploadedSubs = probe.uploaded_subtitles || [];
   const embedCandidates = [...siblingSubs, ...uploadedSubs];
 
-  let subRows = subs.length ? subs.map(s => `
+  let audioRows = audios.length ? audios.map((a, i) => `
     <tr>
+      <td><input type="checkbox" class="track-audio-keep" checked data-stream-index="${a.index}"></td>
+      <td>#${a.index}</td>
+      <td>${escapeHtml(a.codec || '')}</td>
+      <td>${escapeHtml(a.language || '')}</td>
+      <td>${escapeHtml(a.title || '')}</td>
+      <td>${escapeHtml(a.channel_layout || (a.channels ? String(a.channels) + 'ch' : ''))}</td>
+      <td><input type="number" class="track-audio-order" value="${(i + 1) * 10}" style="width:70px"></td>
+      <td><input type="radio" name="defaultAudio" class="track-audio-default" ${a.disposition?.default ? 'checked' : ''}></td>
+    </tr>`).join('') : '<tr><td colspan="8" class="muted">没有内封音频轨道</td></tr>';
+
+  let subRows = subs.length ? subs.map((s, i) => `
+    <tr>
+      <td><input type="checkbox" class="track-subtitle-keep" checked data-stream-index="${s.index}"></td>
       <td>#${s.index}</td>
-      <td>${s.codec || ''}</td>
-      <td>${s.language || ''}</td>
-      <td>${s.title || ''}</td>
+      <td>${escapeHtml(s.codec || '')}</td>
+      <td>${escapeHtml(s.language || '')}</td>
+      <td>${escapeHtml(s.title || '')}</td>
+      <td><input type="number" class="track-subtitle-order" value="${500 + (i + 1) * 10}" style="width:70px"></td>
+      <td><input type="radio" name="defaultSubtitle" class="track-subtitle-default" ${s.disposition?.default ? 'checked' : ''}></td>
       <td>
         <div class="extract-actions">
           <button data-extract='${JSON.stringify({stream_index:s.index, codec:s.codec})}'>提取</button>
           <div class="extract-download-slot" data-download-slot="${s.index}"></div>
         </div>
       </td>
-    </tr>`).join('') : '<tr><td colspan="5" class="muted">没有内封字幕轨道</td></tr>';
+    </tr>`).join('') : '<tr><td colspan="8" class="muted">没有内封字幕轨道</td></tr>';
 
-  let subOptions = embedCandidates.map(s => {
+  let subOptions = embedCandidates.map((s, i) => {
     const isUpload = s.source === 'upload';
     const sourceTag = isUpload ? '<span class="tag temp">临时</span>' : '<span class="tag subtitle">目录</span>';
     const ext = subtitleExt(s.name || s.path);
@@ -396,9 +471,10 @@ function renderDetail(entry, probe) {
        <input type="checkbox" class="embed-sub" data-path="${escapeHtml(s.path)}" data-ext="${escapeHtml(ext)}">
        ${sourceTag}
        ${escapeHtml(s.name)}
+       <input type="number" placeholder="顺序" class="embed-order" style="width:70px" value="${1000 + (i + 1) * 10}">
        <input type="text" placeholder="语言(如 chi/eng)" class="embed-lang" style="width:100px" value="und">
        <input type="text" placeholder="标题" class="embed-title" style="width:140px">
-       <label class="muted"><input type="checkbox" class="embed-default"> 默认</label>
+       <label class="muted"><input type="radio" name="defaultSubtitle" class="embed-default"> 默认</label>
      </label>`;
   }).join('');
   if (!subOptions) subOptions = '<div class="muted">当前没有可用于封装的字幕文件</div>';
@@ -430,9 +506,17 @@ function renderDetail(entry, probe) {
     </section>
 
     <section>
-      <h2>内封字幕轨道（提取）</h2>
+      <h2>内封音频轨道（封装）</h2>
       <table>
-        <tr><th>索引</th><th>编码</th><th>语言</th><th>标题</th><th></th></tr>
+        <tr><th>保留</th><th>索引</th><th>编码</th><th>语言</th><th>标题</th><th>声道</th><th>顺序</th><th>默认</th></tr>
+        ${audioRows}
+      </table>
+    </section>
+
+    <section>
+      <h2>内封字幕轨道（提取/封装）</h2>
+      <table>
+        <tr><th>保留</th><th>索引</th><th>编码</th><th>语言</th><th>标题</th><th>顺序</th><th>默认</th><th></th></tr>
         ${subRows}
       </table>
       <div class="log" id="extractLog" style="display:none"></div>
@@ -447,6 +531,8 @@ function renderDetail(entry, probe) {
       ${subOptions}
       <div class="row" style="margin-top:10px">
         <label><input type="checkbox" id="keepExisting" checked> 保留原有内封字幕</label>
+        <button type="button" class="secondary" id="selectAllInternalSubtitles">全选内封字幕</button>
+        <button type="button" class="secondary" id="clearInternalSubtitles">取消内封字幕</button>
         <label><input type="checkbox" id="useDefaultOutputDir" ${defaultOutputDir ? '' : 'disabled'}> 使用默认输出路径</label>
         <span class="muted" id="defaultOutputDirHint">默认输出路径：${defaultOutputDir ? escapeHtml(defaultOutputDir) : '未配置'}</span>
       </div>
@@ -490,6 +576,17 @@ function renderDetail(entry, probe) {
   document.getElementById('doEmbed').onclick = () => doEmbed(entry);
   document.getElementById('subtitleMode').onchange = updateEmbedSettingsState;
   document.getElementById('pgsResolutionMode').onchange = updateEmbedSettingsState;
+  document.getElementById('keepExisting').onchange = e => {
+    c.querySelectorAll('.track-subtitle-keep').forEach(cb => cb.checked = e.target.checked);
+  };
+  document.getElementById('selectAllInternalSubtitles').onclick = () => {
+    c.querySelectorAll('.track-subtitle-keep').forEach(cb => cb.checked = true);
+    document.getElementById('keepExisting').checked = true;
+  };
+  document.getElementById('clearInternalSubtitles').onclick = () => {
+    c.querySelectorAll('.track-subtitle-keep').forEach(cb => cb.checked = false);
+    document.getElementById('keepExisting').checked = false;
+  };
   c.querySelectorAll('.embed-sub').forEach(cb => {
     cb.onchange = updateEmbedSettingsState;
   });
@@ -607,7 +704,26 @@ async function doEmbed(entry) {
   const log = document.getElementById('embedLog');
   log.style.display = '';
   const checks = [...document.querySelectorAll('.embed-sub:checked')];
-  if (!checks.length) { log.textContent = '请至少选择一个字幕文件'; return; }
+  const audioTracks = [...document.querySelectorAll('.track-audio-keep')].map(cb => {
+    const row = cb.closest('tr');
+    return {
+      source: 'existing',
+      stream_index: Number(cb.dataset.streamIndex),
+      keep: cb.checked,
+      order: Number(row.querySelector('.track-audio-order').value || 0),
+      default: row.querySelector('.track-audio-default').checked,
+    };
+  });
+  const internalSubtitleTracks = [...document.querySelectorAll('.track-subtitle-keep')].map(cb => {
+    const row = cb.closest('tr');
+    return {
+      source: 'existing',
+      stream_index: Number(cb.dataset.streamIndex),
+      keep: cb.checked,
+      order: Number(row.querySelector('.track-subtitle-order').value || 0),
+      default: row.querySelector('.track-subtitle-default').checked,
+    };
+  });
   const subs = checks.map(cb => {
     const row = cb.parentElement;
     return {
@@ -615,12 +731,19 @@ async function doEmbed(entry) {
       ext: cb.dataset.ext,
       language: row.querySelector('.embed-lang').value || 'und',
       title: row.querySelector('.embed-title').value || '',
+      order: Number(row.querySelector('.embed-order').value || 0),
       default: row.querySelector('.embed-default').checked,
     };
   });
+  if (!subs.length && !internalSubtitleTracks.some(track => track.keep)) { log.textContent = '请至少选择一个字幕轨道或字幕文件'; return; }
+  const externalSubtitleTracks = subs.map(({ext, ...sub}) => ({ source: 'external', keep: true, ...sub }));
   const body = {
     video: entry.path,
     subtitles: subs.map(({ext, ...sub}) => sub),
+    tracks: {
+      audio: audioTracks,
+      subtitle: [...internalSubtitleTracks, ...externalSubtitleTracks],
+    },
     keep_existing: document.getElementById('keepExisting').checked,
     use_default_output_dir: document.getElementById('useDefaultOutputDir').checked,
     subtitle_mode: document.getElementById('subtitleMode').value,
@@ -655,6 +778,19 @@ async function doEmbed(entry) {
 
 document.getElementById('refreshDirBtn').onclick = refreshCurrentDir;
 document.getElementById('clearTempBtn').onclick = clearTempSubtitles;
+document.getElementById('toggleTaskPanel').onclick = () => {
+  state.taskPanelCollapsed = !state.taskPanelCollapsed;
+  renderTasks();
+};
+document.getElementById('taskFilter').onchange = e => {
+  state.taskFilter = e.target.value;
+  renderTasks();
+};
+document.getElementById('hideCanceledTasks').onchange = e => {
+  state.hideCanceled = e.target.checked;
+  renderTasks();
+};
+document.getElementById('clearCanceledTasks').onclick = clearCanceledTasks;
 loadVersion();
 loadTasks();
 setInterval(loadTasks, 2000);

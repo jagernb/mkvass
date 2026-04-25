@@ -219,6 +219,40 @@ def _count_subtitle_streams(video: Path) -> int:
     return len(json.loads(probe.decode()).get("streams", []))
 
 
+def _probe_streams(video: Path) -> list[dict]:
+    probe = subprocess.check_output([
+        "ffprobe", "-v", "error",
+        "-print_format", "json",
+        "-show_streams",
+        str(video),
+    ], stderr=subprocess.STDOUT, timeout=60)
+    return json.loads(probe.decode("utf-8", errors="ignore")).get("streams", [])
+
+
+def _stream_track_info(stream: dict) -> dict:
+    tags = stream.get("tags") or {}
+    info = {
+        "index": stream.get("index"),
+        "codec": stream.get("codec_name"),
+        "language": tags.get("language"),
+        "title": tags.get("title"),
+        "disposition": stream.get("disposition") or {},
+    }
+    if stream.get("codec_type") == "audio":
+        info["channels"] = stream.get("channels")
+        info["channel_layout"] = stream.get("channel_layout")
+    return info
+
+
+def _streams_by_type(streams: list[dict], codec_type: str) -> list[dict]:
+    return [stream for stream in streams if stream.get("codec_type") == codec_type]
+
+
+def _stream_index(stream: dict) -> int | None:
+    index = stream.get("index")
+    return index if isinstance(index, int) else None
+
+
 def _format_frame_rate_value(value: float) -> str:
     return f"{value:.3f}".rstrip("0").rstrip(".")
 
@@ -422,64 +456,218 @@ def _subtitle_warning_for_existing_pgs(prepared_subs: list[dict]) -> list[str]:
     return []
 
 
-def _build_ffmpeg_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool) -> list[str]:
+def _parse_order(value, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _one_default(items: list[dict]) -> None:
+    found = False
+    for item in items:
+        if item.get("default") and not found:
+            found = True
+        else:
+            item["default"] = False
+
+
+def _meta_for_existing_stream(stream: dict, override: dict | None = None) -> dict:
+    override = override or {}
+    tags = stream.get("tags") or {}
+    disposition = stream.get("disposition") or {}
+    return {
+        "language": override.get("language") or tags.get("language") or "und",
+        "title": override.get("title") if override.get("title") is not None else (tags.get("title") or ""),
+        "default": bool(override.get("default", disposition.get("default") == 1)),
+    }
+
+
+def _external_track_settings(tracks: dict, fallback_subs: list[dict]) -> dict[str, dict]:
+    settings: dict[str, dict] = {}
+    for idx, sub in enumerate(fallback_subs):
+        path = sub.get("path")
+        if path:
+            settings[path] = {**sub, "keep": True, "order": _parse_order(sub.get("order"), 1000 + idx)}
+    if not isinstance(tracks, dict):
+        return settings
+    for idx, track in enumerate(tracks.get("subtitle") or []):
+        if not isinstance(track, dict) or track.get("source") != "external":
+            continue
+        path = track.get("path")
+        if not path:
+            continue
+        if not bool(track.get("keep", True)):
+            settings.pop(path, None)
+            continue
+        settings[path] = {**settings.get(path, {}), **track, "keep": True, "order": _parse_order(track.get("order"), 1000 + idx)}
+    return settings
+
+
+def _build_mux_plan(video: Path, prepared_subs: list[dict], body: dict) -> dict:
+    tracks = body.get("tracks") if isinstance(body.get("tracks"), dict) else None
+    streams = _probe_streams(video)
+    audio_streams = _streams_by_type(streams, "audio")
+    subtitle_streams = _streams_by_type(streams, "subtitle")
+    audio_by_index = {idx: stream for stream in audio_streams if (idx := _stream_index(stream)) is not None}
+    subtitle_by_index = {idx: stream for stream in subtitle_streams if (idx := _stream_index(stream)) is not None}
+
+    if tracks:
+        audio_tracks = tracks.get("audio") or []
+        existing_sub_tracks = [track for track in (tracks.get("subtitle") or []) if isinstance(track, dict) and track.get("source") == "existing"]
+    else:
+        audio_tracks = [{"stream_index": idx, "keep": True} for idx in audio_by_index]
+        existing_sub_tracks = [
+            {"stream_index": idx, "keep": bool(body.get("keep_existing", True))}
+            for idx in subtitle_by_index
+        ]
+
+    audio_items = []
+    for pos, track in enumerate(audio_tracks):
+        if not isinstance(track, dict) or not bool(track.get("keep", True)):
+            continue
+        try:
+            stream_index = int(track.get("stream_index"))
+        except (TypeError, ValueError):
+            raise ValueError("invalid audio track index")
+        stream = audio_by_index.get(stream_index)
+        if stream is None:
+            raise ValueError(f"audio track not found: {stream_index}")
+        audio_items.append({
+            "source": "existing",
+            "stream_index": stream_index,
+            "order": _parse_order(track.get("order"), pos * 10),
+            "meta": _meta_for_existing_stream(stream, track),
+            "default": bool(track.get("default", (stream.get("disposition") or {}).get("default") == 1)),
+        })
+
+    subtitle_items = []
+    for pos, track in enumerate(existing_sub_tracks):
+        if not isinstance(track, dict) or not bool(track.get("keep", True)):
+            continue
+        try:
+            stream_index = int(track.get("stream_index"))
+        except (TypeError, ValueError):
+            raise ValueError("invalid subtitle track index")
+        stream = subtitle_by_index.get(stream_index)
+        if stream is None:
+            raise ValueError(f"subtitle track not found: {stream_index}")
+        meta = _meta_for_existing_stream(stream, track)
+        subtitle_items.append({
+            "source": "existing",
+            "stream_index": stream_index,
+            "order": _parse_order(track.get("order"), 500 + pos * 10),
+            "meta": meta,
+            "codec": "copy",
+            "default": bool(track.get("default", meta.get("default"))),
+        })
+
+    fallback_subs = [prepared["meta"] for prepared in prepared_subs]
+    external_settings = _external_track_settings(tracks or {"subtitle": []}, fallback_subs)
+    for pos, prepared in enumerate(prepared_subs):
+        rel_path = rel_to_media(prepared["path"])
+        setting = external_settings.get(rel_path) or external_settings.get(str(prepared["path"]))
+        if setting is None:
+            continue
+        meta = {
+            "language": setting.get("language") or "und",
+            "title": setting.get("title") or "",
+            "default": bool(setting.get("default")),
+        }
+        subtitle_items.append({
+            "source": "external",
+            "path": prepared["path"],
+            "input_index": pos + 1,
+            "order": _parse_order(setting.get("order"), 1000 + pos * 10),
+            "meta": meta,
+            "codec": prepared["codec"],
+            "default": bool(setting.get("default")),
+        })
+
+    audio_items.sort(key=lambda item: (item["order"], item["stream_index"]))
+    subtitle_items.sort(key=lambda item: (item["order"], item.get("stream_index", 10_000), str(item.get("path", ""))))
+    _one_default(audio_items)
+    _one_default(subtitle_items)
+    for item in audio_items:
+        item["meta"]["default"] = item["default"]
+    for item in subtitle_items:
+        item["meta"]["default"] = item["default"]
+    return {"audio": audio_items, "subtitles": subtitle_items}
+
+
+def _build_legacy_mux_plan(video: Path, prepared_subs: list[dict], keep_existing: bool) -> dict:
+    return _build_mux_plan(video, prepared_subs, {"subtitles": [prepared["meta"] for prepared in prepared_subs], "keep_existing": keep_existing})
+
+
+def _build_ffmpeg_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool, mux_plan: dict | None = None) -> list[str]:
+    mux_plan = mux_plan or _build_legacy_mux_plan(video, prepared_subs, keep_existing)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(video)]
     for prepared in prepared_subs:
         cmd += ["-i", str(prepared["path"])]
 
-    cmd += ["-map", "0:v?", "-map", "0:a?"]
-    if keep_existing:
-        cmd += ["-map", "0:s?"]
-    for i in range(len(prepared_subs)):
-        cmd += ["-map", f"{i + 1}:0"]
+    cmd += ["-map", "0:v?"]
+    for item in mux_plan["audio"]:
+        cmd += ["-map", f"0:{item['stream_index']}"]
+    for item in mux_plan["subtitles"]:
+        if item["source"] == "existing":
+            cmd += ["-map", f"0:{item['stream_index']}"]
+        else:
+            cmd += ["-map", f"{item['input_index']}:0"]
 
     cmd += ["-c:v", "copy", "-c:a", "copy"]
 
-    base_sub_index = 0
-    if keep_existing:
-        try:
-            base_sub_index = _count_subtitle_streams(video)
-        except Exception:
-            base_sub_index = 0
-        for idx in range(base_sub_index):
-            cmd += [f"-c:s:{idx}", "copy"]
+    for idx, item in enumerate(mux_plan["audio"]):
+        cmd += [f"-disposition:a:{idx}", "default" if item.get("default") else "0"]
 
-    for i, prepared in enumerate(prepared_subs):
-        out_idx = base_sub_index + i
-        cmd += [f"-c:s:{out_idx}", prepared["codec"]]
-        meta = prepared["meta"]
+    for idx, item in enumerate(mux_plan["subtitles"]):
+        cmd += [f"-c:s:{idx}", item["codec"]]
+        meta = item["meta"]
         lang = meta.get("language") or "und"
         title = meta.get("title") or ""
-        cmd += [f"-metadata:s:s:{out_idx}", f"language={lang}"]
+        cmd += [f"-metadata:s:s:{idx}", f"language={lang}"]
         if title:
-            cmd += [f"-metadata:s:s:{out_idx}", f"title={title}"]
-        if meta.get("default"):
-            cmd += [f"-disposition:s:{out_idx}", "default"]
+            cmd += [f"-metadata:s:s:{idx}", f"title={title}"]
+        cmd += [f"-disposition:s:{idx}", "default" if item.get("default") else "0"]
 
     cmd.append(str(out_path))
     return cmd
 
 
-def _build_mkvmerge_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool) -> list[str]:
+def _build_mkvmerge_embed_command(video: Path, out_path: Path, prepared_subs: list[dict], keep_existing: bool, mux_plan: dict | None = None) -> list[str]:
     tool = _resolve_mkvmerge_command()
     if not tool:
         raise RuntimeError("mkvmerge not found")
 
+    mux_plan = mux_plan or _build_legacy_mux_plan(video, prepared_subs, keep_existing)
+    audio_ids = [str(item["stream_index"]) for item in mux_plan["audio"]]
+    existing_subtitle_items = [item for item in mux_plan["subtitles"] if item["source"] == "existing"]
+    existing_subtitle_ids = [str(item["stream_index"]) for item in existing_subtitle_items]
+    external_items = [item for item in mux_plan["subtitles"] if item["source"] == "external"]
+    track_order = [f"0:{item['stream_index']}" for item in mux_plan["audio"]]
+    track_order += [f"0:{item['stream_index']}" for item in existing_subtitle_items]
+    track_order += [f"{input_index}:0" for input_index, _item in enumerate(external_items, start=1)]
+
     cmd = [tool, "-o", str(out_path)]
-    if not keep_existing:
-        cmd.append("--no-subtitles")
+    cmd += ["--audio-tracks", ",".join(audio_ids)] if audio_ids else ["--no-audio"]
+    cmd += ["--subtitle-tracks", ",".join(existing_subtitle_ids)] if existing_subtitle_ids else ["--no-subtitles"]
+    for item in mux_plan["audio"]:
+        cmd += ["--default-track-flag", f"{item['stream_index']}:{'yes' if item.get('default') else 'no'}"]
+    for item in existing_subtitle_items:
+        cmd += ["--default-track-flag", f"{item['stream_index']}:{'yes' if item.get('default') else 'no'}"]
     cmd.append(str(video))
 
-    for prepared in prepared_subs:
-        meta = prepared["meta"]
+    for item in external_items:
+        meta = item["meta"]
         lang = meta.get("language") or "und"
         title = meta.get("title") or ""
         cmd += ["--language", f"0:{lang}"]
         if title:
             cmd += ["--track-name", f"0:{title}"]
-        cmd += ["--default-track-flag", f"0:{'yes' if meta.get('default') else 'no'}"]
-        cmd.append(str(prepared["path"]))
+        cmd += ["--default-track-flag", f"0:{'yes' if item.get('default') else 'no'}"]
+        cmd.append(str(item["path"]))
 
+    if track_order:
+        cmd += ["--track-order", ",".join(track_order)]
     return cmd
 
 
@@ -892,7 +1080,10 @@ def _prepare_embed_task(body: dict) -> tuple[Path, list[tuple[Path, dict]], Path
     subs = body.get("subtitles") or []
     out_name = body.get("out_name")
     subtitle_mode = (body.get("subtitle_mode") or "text").strip() or "text"
-    if not video_rel or not subs:
+    tracks = body.get("tracks") if isinstance(body.get("tracks"), dict) else None
+    if not video_rel:
+        raise ValueError("video required")
+    if not subs and not tracks:
         raise ValueError("video and subtitles required")
     if subtitle_mode not in {"text", "pgs_auto"}:
         raise ValueError("invalid subtitle mode")
@@ -967,14 +1158,15 @@ def _run_embed_task(task_id: str) -> None:
 
         has_pgs_subtitle = any(prepared["path"].suffix.lower() in PGS_SUBTITLE_EXTS for prepared in prepared_subs)
         muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
+        mux_plan = _build_mux_plan(video, prepared_subs, body)
         warnings = _subtitle_warning_for_existing_pgs(prepared_subs)
         _set_task_phase(task_id, "embed", "开始封装")
         _update_task(task_id, muxer=muxer, warnings=warnings)
         if muxer == "mkvmerge":
-            cmd = _build_mkvmerge_progress_command(_build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing))
+            cmd = _build_mkvmerge_progress_command(_build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing, mux_plan))
             progress_parser = _parse_mkvmerge_progress
         else:
-            cmd = _build_ffmpeg_progress_command(_build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing))
+            cmd = _build_ffmpeg_progress_command(_build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing, mux_plan))
             duration = _video_duration_seconds(video)
             progress_parser = lambda line: _parse_ffmpeg_progress(line, duration)
         cmd_text = _task_cmd_text(cmd)
@@ -1191,18 +1383,8 @@ def api_probe():
 
     data = json.loads(out.decode("utf-8", errors="ignore"))
     streams = data.get("streams", [])
-    subtitles = []
-    for s in streams:
-        if s.get("codec_type") != "subtitle":
-            continue
-        tags = s.get("tags") or {}
-        subtitles.append({
-            "index": s.get("index"),
-            "codec": s.get("codec_name"),
-            "language": tags.get("language"),
-            "title": tags.get("title"),
-            "disposition": s.get("disposition") or {},
-        })
+    audios = [_stream_track_info(s) for s in streams if s.get("codec_type") == "audio"]
+    subtitles = [_stream_track_info(s) for s in streams if s.get("codec_type") == "subtitle"]
 
     pgs_status = _pgs_converter_status()
 
@@ -1210,6 +1392,7 @@ def api_probe():
         "path": rel_to_media(target),
         "format": data.get("format", {}),
         "streams": streams,
+        "audios": audios,
         "subtitles": subtitles,
         "uploaded_subtitles": _list_uploaded_subtitles(target),
         "default_output_dir": _configured_default_output_dir_rel(),
@@ -1419,6 +1602,22 @@ def api_task(task_id: str):
     return jsonify(data)
 
 
+@app.route("/api/tasks/<task_id>", methods=["DELETE"])
+def api_delete_task(task_id: str):
+    with TASK_LOCK:
+        task = TASKS.get(task_id)
+        if task is None:
+            return jsonify(error="task not found"), 404
+        if task.get("status") not in FINAL_TASK_STATUSES:
+            return jsonify(error="task is not finished"), 400
+        TASKS.pop(task_id, None)
+        try:
+            TASK_QUEUE.remove(task_id)
+        except ValueError:
+            pass
+    return jsonify({"ok": True})
+
+
 @app.route("/api/tasks/<task_id>/diagnostic")
 def api_task_diagnostic(task_id: str):
     with TASK_LOCK:
@@ -1487,7 +1686,10 @@ def api_embed():
 
     use_default_output_dir = embed_settings["use_default_output_dir"]
 
-    if not video_rel or not subs:
+    tracks = body.get("tracks") if isinstance(body.get("tracks"), dict) else None
+    if not video_rel:
+        return jsonify(error="video required"), 400
+    if not subs and not tracks:
         return jsonify(error="video and subtitles required"), 400
     if subtitle_mode not in {"text", "pgs_auto"}:
         return jsonify(error="invalid subtitle mode"), 400
@@ -1534,12 +1736,15 @@ def api_embed():
         muxer = "mkvmerge" if has_pgs_subtitle else "ffmpeg"
         warnings = _subtitle_warning_for_existing_pgs(prepared_subs)
         try:
+            mux_plan = _build_mux_plan(video, prepared_subs, body)
             if muxer == "mkvmerge":
-                cmd = _build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing)
+                cmd = _build_mkvmerge_embed_command(video, out_path, prepared_subs, keep_existing, mux_plan)
             else:
-                cmd = _build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing)
+                cmd = _build_ffmpeg_embed_command(video, out_path, prepared_subs, keep_existing, mux_plan)
         except RuntimeError as exc:
             return jsonify(error=str(exc)), 500
+        except ValueError as exc:
+            return jsonify(error=str(exc)), 400
 
         try:
             subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=3600)

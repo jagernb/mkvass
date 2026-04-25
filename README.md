@@ -78,7 +78,7 @@ docker compose up -d
 默认会使用 `latest`。如果你想锁定正式版本，可在启动前设置环境变量，例如：
 
 ```bash
-export MKVASS_TAG=1.1.1
+export MKVASS_TAG=1.1.2
 docker compose pull
 docker compose up -d
 ```
@@ -133,10 +133,10 @@ volumes:
 仓库新增了 GitHub Actions 工作流 [docker-image.yml](.github/workflows/docker-image.yml)：
 
 - push 到 `main` 时自动构建镜像
-- push `v*` Git tag（例如 `v1.1.1`）时自动发布正式版本标签
+- push `v*` Git tag（例如 `v1.1.2`）时自动发布正式版本标签
 - 自动推送到 Docker Hub
 - 默认发布 `latest`、分支名、commit sha 标签
-- Git tag 发布时额外生成 `1.1.1`、`1.1` 这类版本标签
+- Git tag 发布时额外生成 `1.1.2`、`1.1` 这类版本标签
 - 镜像会写入 OCI 标签 `org.opencontainers.image.version` 与 `org.opencontainers.image.created`，容器内也可读取 `APP_VERSION` 和 `BUILD_DATE`
 
 首次启用时请确认：
@@ -150,13 +150,13 @@ volumes:
 当你需要发布一个可固定部署、可回退的正式版本时：
 
 ```bash
-git tag v1.1.1
-git push origin v1.1.1
+git tag v1.1.2
+git push origin v1.1.2
 ```
 
 随后 GitHub Actions 会自动发布这些镜像标签：
 
-- `jagernb/mkvass:1.1.1`
+- `jagernb/mkvass:1.1.2`
 - `jagernb/mkvass:1.1`
 
 ### 回退到旧版本
@@ -164,7 +164,7 @@ git push origin v1.1.1
 如果需要回退，只要把部署机上的 `MKVASS_TAG` 改成旧版本号，再重新拉取并启动：
 
 ```bash
-export MKVASS_TAG=1.1.1
+export MKVASS_TAG=1.1.2
 docker compose pull
 docker compose up -d
 ```
