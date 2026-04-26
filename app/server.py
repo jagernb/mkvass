@@ -1384,6 +1384,8 @@ def _task_worker() -> None:
                 task_type = task.get("type")
             if task_type == "pgs":
                 _run_pgs_task(task_id)
+            elif task_type == "extract":
+                _run_extract_task(task_id)
             else:
                 _run_embed_task(task_id)
 
@@ -1408,14 +1410,16 @@ def _base_task(body: dict, task_type: str, *, phase: str = "queued", message: st
         "updated_at": now,
         "status": "pending",
         "phase": phase,
-        "video": body.get("video") or "",
+        "video": body.get("video") or body.get("path") or "",
         "subtitle": body.get("subtitle") or "",
         "out_name": body.get("out_name") or "",
         "output": "",
         "output_dir": "",
+        "download_url": "",
         "subtitle_mode": body.get("subtitle_mode") or "text",
         "pgs_progress": _progress(0, "等待 PGS 转换", False),
         "embed_progress": _progress(0, "等待封装", False),
+        "extract_progress": _progress(0, "等待提取", False),
         "message": message,
         "cmd": "",
         "error": "",
@@ -1476,6 +1480,16 @@ def _create_embed_task_chain(body: dict) -> list[dict]:
 
 def _create_pgs_only_task(body: dict) -> dict:
     task = _base_task(body, "pgs", message="等待 PGS 转换")
+    with TASK_LOCK:
+        TASKS[task["id"]] = task
+        TASK_QUEUE.append(task["id"])
+        TASK_EVENT.set()
+    _ensure_task_worker()
+    return task
+
+
+def _create_extract_task(body: dict) -> dict:
+    task = _base_task(body, "extract", message="等待提取字幕")
     with TASK_LOCK:
         TASKS[task["id"]] = task
         TASK_QUEUE.append(task["id"])
@@ -1625,34 +1639,26 @@ def _codec_to_ext(codec: str | None) -> str:
     return ".srt"
 
 
-@app.route("/api/extract", methods=["POST"])
-def api_extract():
-    body = request.get_json(silent=True) or {}
+def _prepare_extract_task(body: dict) -> tuple[Path, Path, list[str]]:
     rel = body.get("path", "")
     stream_index = body.get("stream_index")
     codec = body.get("codec")
     out_name = body.get("out_name")
 
     if stream_index is None:
-        return jsonify(error="stream_index required"), 400
-    try:
-        target = safe_path(rel)
-    except ValueError:
-        return jsonify(error="invalid path"), 400
+        raise ValueError("stream_index required")
+    target = safe_path(rel)
     if not target.is_file():
-        return jsonify(error="not a file"), 404
+        raise FileNotFoundError("not a file")
 
     ext = _codec_to_ext(codec)
-    try:
-        out_name = _validate_output_name(out_name, f"{target.stem}.track{stream_index}{ext}")
-    except ValueError:
-        return jsonify(error="invalid output name"), 400
+    out_name = _validate_output_name(out_name, f"{target.stem}.track{stream_index}{ext}")
     if Path(out_name).suffix.lower() not in (ext, ".srt", ".ass", ".vtt"):
         out_name = out_name + ext
 
     out_path = (target.parent / out_name).resolve()
     if MEDIA_DIR not in out_path.parents and out_path != MEDIA_DIR:
-        return jsonify(error="output path invalid"), 400
+        raise ValueError("output path invalid")
 
     bitmap = (codec or "").lower() in {"hdmv_pgs_subtitle", "dvd_subtitle", "dvb_subtitle"}
     cmd = [
@@ -1670,19 +1676,81 @@ def api_extract():
         elif ext == ".vtt":
             cmd += ["-c:s", "webvtt"]
     cmd.append(str(out_path))
+    return target, out_path, cmd
 
+
+def _run_extract_sync(body: dict) -> dict:
+    _target, out_path, cmd = _prepare_extract_task(body)
     try:
         subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=600)
     except subprocess.CalledProcessError as exc:
-        return jsonify(error="ffmpeg failed", cmd=" ".join(shlex.quote(c) for c in cmd),
-                       detail=exc.output.decode(errors="ignore")), 500
-
-    return jsonify({
+        raise RuntimeError(exc.output.decode(errors="ignore")) from exc
+    output = rel_to_media(out_path)
+    return {
         "ok": True,
-        "output": rel_to_media(out_path),
-        "download_url": f"/api/download?path={quote(rel_to_media(out_path), safe='')}",
+        "output": output,
+        "download_url": f"/api/download?path={quote(output, safe='')}",
         "cmd": " ".join(shlex.quote(c) for c in cmd),
-    })
+    }
+
+
+def _run_extract_task(task_id: str) -> None:
+    with TASK_LOCK:
+        body = TASKS[task_id]["body"]
+    cmd_text = ""
+    out_path = None
+    try:
+        target, out_path, cmd = _prepare_extract_task(body)
+        duration = _video_duration_seconds(target)
+        progress_cmd = _build_ffmpeg_progress_command(cmd)
+        cmd_text = _task_cmd_text(progress_cmd)
+        _set_task_phase(task_id, "extract", "开始提取字幕")
+        _run_task_process(
+            task_id,
+            progress_cmd,
+            phase="字幕提取",
+            progress_key="extract_progress",
+            progress_parser=lambda line: _parse_ffmpeg_progress(line, duration),
+            complete_percent=100,
+        )
+        output = rel_to_media(out_path)
+        output_dir = rel_to_media(out_path.parent) if out_path.parent != MEDIA_DIR else ""
+        _update_task(
+            task_id,
+            status="succeeded",
+            phase="done",
+            output=output,
+            output_dir=output_dir,
+            download_url=f"/api/download?path={quote(output, safe='')}",
+            cmd=cmd_text,
+            message="字幕提取完成",
+        )
+    except Exception as exc:
+        if out_path and out_path.exists():
+            out_path.unlink(missing_ok=True)
+        if _task_cancel_requested(task_id) or str(exc) == "task canceled":
+            _update_task(task_id, status="canceled", phase="canceled", message="字幕提取已取消", error="", cmd=cmd_text)
+        else:
+            _update_task(task_id, status="failed", phase="error", message="字幕提取失败", error=str(exc), cmd=cmd_text)
+
+
+@app.route("/api/extract", methods=["POST"])
+def api_extract():
+    body = request.get_json(silent=True) or {}
+    try:
+        result = _run_extract_sync(body)
+    except FileNotFoundError as exc:
+        return jsonify(error=str(exc)), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+    except RuntimeError as exc:
+        try:
+            _target, _out_path, cmd = _prepare_extract_task(body)
+            cmd_text = " ".join(shlex.quote(c) for c in cmd)
+        except Exception:
+            cmd_text = ""
+        return jsonify(error="ffmpeg failed", cmd=cmd_text, detail=str(exc)), 500
+    return jsonify(result)
 
 
 @app.route("/api/upload-subtitle", methods=["POST"])
@@ -1802,6 +1870,20 @@ def api_create_pgs_task():
         return jsonify(error=str(exc)), 400
 
     task = _create_pgs_only_task(body)
+    return jsonify({"ok": True, "task": _public_task(task)}), 202
+
+
+@app.route("/api/tasks/extract", methods=["POST"])
+def api_create_extract_task():
+    body = request.get_json(silent=True) or {}
+    try:
+        _prepare_extract_task(body)
+    except FileNotFoundError as exc:
+        return jsonify(error=str(exc)), 404
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+    task = _create_extract_task(body)
     return jsonify({"ok": True, "task": _public_task(task)}), 202
 
 

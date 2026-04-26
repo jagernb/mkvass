@@ -283,6 +283,7 @@ function taskPhaseText(phase) {
     queued: '排队',
     waiting_pgs: '等待 PGS 转换',
     pgs: 'PGS 转换',
+    extract: '字幕提取',
     embed: '封装',
     done: '完成',
     error: '失败',
@@ -293,6 +294,7 @@ function taskPhaseText(phase) {
 function taskTypeText(type) {
   return {
     pgs: 'PGS 转换任务',
+    extract: '字幕提取任务',
     embed: '封装任务',
   }[type] || '任务';
 }
@@ -372,10 +374,13 @@ function renderTasks() {
     const warningText = Array.isArray(task.warnings) && task.warnings.length ? `<div class="muted">警告: ${escapeHtml(task.warnings.join('；'))}</div>` : '';
     const errorText = task.error ? `<div style="color:#f66">${escapeHtml(task.error)}</div>` : '';
     const outputText = task.output ? `<div class="muted">输出: ${escapeHtml(task.output)}</div>` : '';
+    const taskDownload = task.status === 'succeeded' && task.download_url ? `<a class="download-btn" href="${escapeHtml(task.download_url)}">下载字幕</a>` : '';
     const detailHtml = `${taskDiagnosticsHtml(task)}${outputText}${warningText}${errorText}`;
     const primaryProgress = task.type === 'pgs'
       ? progressHtml('PGS', task.pgs_progress)
-      : progressHtml('封装', task.embed_progress);
+      : task.type === 'extract'
+        ? progressHtml('提取', task.extract_progress)
+        : progressHtml('封装', task.embed_progress);
     return `<div class="task-card${statusClass}">
       <div class="task-grid">
         <div>
@@ -385,6 +390,7 @@ function renderTasks() {
         ${primaryProgress}
         <div class="muted">${task.depends_on ? '依赖: ' + escapeHtml(task.depends_on.slice(0, 8)) : ''}</div>
         <div class="row">
+          ${taskDownload}
           ${canCancel ? `<button class="secondary" data-cancel-task="${escapeHtml(task.id)}" ${task.status === 'canceling' ? 'disabled' : ''}>取消</button>` : ''}
           ${canDelete ? `<button class="secondary" data-delete-task="${escapeHtml(task.id)}">清除</button>` : ''}
         </div>
@@ -566,7 +572,6 @@ function renderDetail(entry, probe) {
       <td>
         <div class="extract-actions">
           <button data-extract='${JSON.stringify({stream_index:s.index, codec:s.codec})}'>提取</button>
-          <div class="extract-download-slot" data-download-slot="${s.index}"></div>
         </div>
       </td>
     </tr>`).join('') : '<tr><td colspan="8" class="muted">没有内封字幕轨道</td></tr>';
@@ -751,21 +756,17 @@ function updateEmbedSettingsState() {
 
 async function doExtract(entry, info, btn) {
   const log = document.getElementById('extractLog');
-  const slot = btn.parentElement.querySelector('[data-download-slot]');
   log.style.display = '';
-  log.textContent = '提取中...';
-  if (slot) slot.innerHTML = '';
+  log.textContent = '正在添加提取任务...';
   btn.disabled = true;
   try {
-    const res = await api('/api/extract', {
+    const res = await api('/api/tasks/extract', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({ path: entry.path, stream_index: info.stream_index, codec: info.codec }),
     });
-    log.textContent = `已生成: ${res.output}\n\n${res.cmd}`;
-    if (slot && res.download_url) {
-      slot.innerHTML = `<a class="download-btn" href="${escapeHtml(res.download_url)}">下载字幕</a>`;
-    }
+    log.textContent = `提取任务已添加: ${res.task.id}\n请在任务区查看进度和下载按钮，可继续切换目录添加其他任务。`;
+    await loadTasks();
   } catch (e) {
     log.textContent = '失败: ' + e.message;
   } finally {
