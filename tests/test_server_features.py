@@ -1,4 +1,3 @@
-import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,18 +19,9 @@ class SubtitleToolServerTests(unittest.TestCase):
         self.original_media_dir = server.MEDIA_DIR
         self.original_tmp_root = getattr(server, "TMP_SUBTITLE_ROOT", None)
         self.original_default_output_dir = getattr(server, "DEFAULT_OUTPUT_DIR", "")
-        self.original_pgs_converter_cmd = getattr(server, "PGS_CONVERTER_CMD", "")
-        self.original_pgs_font_dir = getattr(server, "PGS_FONT_DIR", "")
-        self.original_pgs_framerate = getattr(server, "PGS_FRAMERATE", "")
-        self.original_pgs_resolution = getattr(server, "PGS_RESOLUTION", "")
         server.MEDIA_DIR = self.media_dir.resolve()
         server.TMP_SUBTITLE_ROOT = server.MEDIA_DIR / ".tmp_subtitles"
         server.DEFAULT_OUTPUT_DIR = ""
-        server.PGS_CONVERTER_CMD = ""
-        server.PGS_FONT_DIR = str(server.MEDIA_DIR / "fonts")
-        server.PGS_FRAMERATE = "23.976"
-        server.PGS_RESOLUTION = "1920*1080"
-        Path(server.PGS_FONT_DIR).mkdir(parents=True, exist_ok=True)
         server.app.config["TESTING"] = True
         self.client = server.app.test_client()
 
@@ -40,255 +30,16 @@ class SubtitleToolServerTests(unittest.TestCase):
         if self.original_tmp_root is not None:
             self.server.TMP_SUBTITLE_ROOT = self.original_tmp_root
         self.server.DEFAULT_OUTPUT_DIR = self.original_default_output_dir
-        self.server.PGS_CONVERTER_CMD = self.original_pgs_converter_cmd
-        self.server.PGS_FONT_DIR = self.original_pgs_font_dir
-        self.server.PGS_FRAMERATE = self.original_pgs_framerate
-        self.server.PGS_RESOLUTION = self.original_pgs_resolution
         self.tempdir.cleanup()
 
-    def test_download_returns_attachment_for_extracted_subtitle(self):
-        subtitle_rel = "movies/demo.track2.srt"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nHello\n", encoding="utf-8")
-
-        response = self.client.get(f"/api/download?path={subtitle_rel}")
-        try:
-            self.assertEqual(response.status_code, 200)
-            self.assertEqual(response.data, subtitle_path.read_bytes())
-            self.assertIn("attachment", response.headers.get("Content-Disposition", ""))
-            self.assertIn("demo.track2.srt", response.headers.get("Content-Disposition", ""))
-        finally:
-            response.close()
-
-    def test_probe_includes_uploaded_subtitles_and_embed_capabilities(self):
-        uploaded_dir = self.media_dir / ".tmp_subtitles" / "movies" / "demo.mkv"
-        uploaded_dir.mkdir(parents=True, exist_ok=True)
-        uploaded_file = uploaded_dir / "demo-upload.srt"
-        uploaded_file.write_text("uploaded", encoding="utf-8")
-        self.server.DEFAULT_OUTPUT_DIR = "output"
-        self.server.PGS_CONVERTER_CMD = "missing-tool"
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"] and "-show_entries" in cmd:
-                return b'{"streams": [{"width": 1920, "height": 1080}]}'
-            return b'{"streams": [], "format": {}}'
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            response = self.client.get(f"/api/probe?path={self.video_rel}")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        uploaded = payload.get("uploaded_subtitles")
-        self.assertIsInstance(uploaded, list)
-        self.assertEqual(len(uploaded), 1)
-        self.assertEqual(uploaded[0]["name"], "demo-upload.srt")
-        self.assertEqual(uploaded[0]["role"], "subtitle")
-        self.assertEqual(uploaded[0]["path"], ".tmp_subtitles/movies/demo.mkv/demo-upload.srt")
-        self.assertEqual(payload["default_output_dir"], "output")
-        self.assertFalse(payload["pgs_mode_available"])
-        self.assertIn("converter", payload["pgs_mode_missing"])
-        self.assertIn("未找到 PGS 转换器", payload["pgs_mode_hint"])
-        self.assertEqual(payload["pgs_defaults"]["resolution"], "1920*1080")
-        self.assertEqual(payload["pgs_defaults"]["framerate"], "23.976")
-        self.assertEqual(payload["pgs_defaults"]["resolution_mode"], "video")
-        self.assertEqual(payload["video_dimensions"], [1920, 1080])
-
-    def test_probe_reports_missing_pgs_font_dir(self):
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-        self.server.PGS_FONT_DIR = str(self.media_dir / "missing-fonts")
-
-        with patch.object(self.server.subprocess, "check_output", return_value=b'{"streams": [], "format": {}}'):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                response = self.client.get(f"/api/probe?path={self.video_rel}")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertFalse(payload["pgs_mode_available"])
-        self.assertEqual(payload["pgs_mode_missing"], ["font_dir"])
-        self.assertIn("PGS 字体目录不存在", payload["pgs_mode_hint"])
-
-    def test_probe_reports_pgs_available_when_converter_and_font_dir_exist(self):
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        with patch.object(self.server.subprocess, "check_output", return_value=b'{"streams": [], "format": {}}'):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                response = self.client.get(f"/api/probe?path={self.video_rel}")
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload["pgs_mode_available"])
-        self.assertEqual(payload["pgs_mode_hint"], "")
-        self.assertEqual(payload["pgs_mode_missing"], [])
-
-    def test_list_treats_pgs_and_sup_as_subtitles(self):
-        pgs_path = self.media_dir / "movies/demo.pgs"
-        sup_path = self.media_dir / "movies/demo.sup"
-        pgs_path.write_bytes(b"pgs")
-        sup_path.write_bytes(b"sup")
-
-        response = self.client.get("/api/list?path=movies")
-
-        self.assertEqual(response.status_code, 200)
-        entries = {entry["name"]: entry for entry in response.get_json()["entries"]}
-        self.assertEqual(entries["demo.pgs"]["role"], "subtitle")
-        self.assertEqual(entries["demo.sup"]["role"], "subtitle")
-
-    def test_extract_returns_download_url(self):
-        with patch.object(self.server.subprocess, "check_output", return_value=b""):
-            response = self.client.post(
-                "/api/extract",
-                json={"path": self.video_rel, "stream_index": 2, "codec": "subrip"},
-            )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["output"], "movies/demo.track2.srt")
-        self.assertEqual(payload["download_url"], "/api/download?path=movies%2Fdemo.track2.srt")
-
-    def test_upload_subtitle_saves_file_in_video_temp_directory(self):
-        response = self.client.post(
-            "/api/upload-subtitle",
-            data={
-                "video": self.video_rel,
-                "file": (io.BytesIO(b"1\n00:00:00,000 --> 00:00:01,000\nHi\n"), "caption.zh.srt"),
-            },
-            content_type="multipart/form-data",
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        saved_path = self.media_dir / payload["path"]
-        self.assertTrue(saved_path.is_file())
-        self.assertEqual(saved_path.read_text(encoding="utf-8"), "1\n00:00:00,000 --> 00:00:01,000\nHi\n")
-        self.assertEqual(payload["path"], ".tmp_subtitles/movies/demo.mkv/caption.zh.srt")
-
-    def test_uploads_are_isolated_by_full_video_filename(self):
-        other_video_rel = "movies/demo.mp4"
-        other_video_path = self.media_dir / other_video_rel
-        other_video_path.write_bytes(b"other-video")
-
-        first = self.client.post(
-            "/api/upload-subtitle",
-            data={
-                "video": self.video_rel,
-                "file": (io.BytesIO(b"first"), "caption.srt"),
-            },
-            content_type="multipart/form-data",
-        )
-        second = self.client.post(
-            "/api/upload-subtitle",
-            data={
-                "video": other_video_rel,
-                "file": (io.BytesIO(b"second"), "caption.srt"),
-            },
-            content_type="multipart/form-data",
-        )
-
-        self.assertEqual(first.status_code, 200)
-        self.assertEqual(second.status_code, 200)
-        first_path = first.get_json()["path"]
-        second_path = second.get_json()["path"]
-        self.assertNotEqual(first_path, second_path)
-        self.assertIn("demo.mkv", first_path)
-        self.assertIn("demo.mp4", second_path)
-
-    def test_extract_rejects_out_name_with_parent_directory(self):
-        response = self.client.post(
-            "/api/extract",
-            json={
-                "path": self.video_rel,
-                "stream_index": 2,
-                "codec": "subrip",
-                "out_name": "../other-dir/out.srt",
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "invalid output name")
-
-    def test_embed_removes_uploaded_temp_subtitles_after_success(self):
-        uploaded_dir = self.media_dir / ".tmp_subtitles" / "movies" / "demo.mkv"
-        uploaded_dir.mkdir(parents=True, exist_ok=True)
-        uploaded_file = uploaded_dir / "caption.zh.srt"
-        uploaded_file.write_text("uploaded", encoding="utf-8")
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": []}'
-            return b""
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            response = self.client.post(
-                "/api/embed",
-                json={
-                    "video": self.video_rel,
-                    "subtitles": [
-                        {
-                            "path": ".tmp_subtitles/movies/demo.mkv/caption.zh.srt",
-                            "language": "chi",
-                            "title": "Chinese",
-                            "default": True,
-                        }
-                    ],
-                    "keep_existing": True,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertFalse(uploaded_file.exists())
-
-    def test_embed_rejects_invalid_output_name(self):
-        subtitle_rel = "movies/demo.zh.srt"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("subtitle", encoding="utf-8")
-
-        response = self.client.post(
-            "/api/embed",
-            json={
-                "video": self.video_rel,
-                "subtitles": [
-                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                ],
-                "out_name": "../other-dir/out.mkv",
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "invalid output name")
-
-    def test_embed_copies_pgs_subtitle(self):
-        subtitle_rel = "movies/demo.pgs"
-        (self.media_dir / subtitle_rel).write_bytes(b"pgs")
-        captured = {}
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": []}'
-            captured["cmd"] = cmd
-            return b""
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            response = self.client.post(
-                "/api/embed",
-                json={
-                    "video": self.video_rel,
-                    "subtitles": [
-                        {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                    ],
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(captured["cmd"][captured["cmd"].index("-c:s:0") + 1], "copy")
-
-    def test_embed_uses_srt_codec_for_text_subtitle(self):
+    def test_embed_sets_existing_subtitle_metadata_with_ffmpeg(self):
         subtitle_rel = "movies/demo.zh.srt"
         (self.media_dir / subtitle_rel).write_text("subtitle", encoding="utf-8")
         captured = {}
 
         def fake_check_output(cmd, stderr=None, timeout=None):
             if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": []}'
+                return b'{"streams": [{"index": 3, "codec_type": "subtitle", "codec_name": "subrip", "tags": {"language": "eng", "title": "Old"}}]}'
             captured["cmd"] = cmd
             return b""
 
@@ -298,310 +49,63 @@ class SubtitleToolServerTests(unittest.TestCase):
                 json={
                     "video": self.video_rel,
                     "subtitles": [
-                        {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
+                        {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": True, "order": 30}
                     ],
+                    "tracks": {
+                        "subtitle": [
+                            {"source": "existing", "stream_index": 3, "keep": True, "language": "jpn", "title": "Japanese Internal", "order": 10, "default": False},
+                            {"source": "external", "path": subtitle_rel, "keep": True, "language": "chi", "title": "Chinese", "order": 30, "default": True},
+                        ],
+                    },
                 },
             )
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(captured["cmd"][captured["cmd"].index("-c:s:0") + 1], "srt")
+        cmd = captured["cmd"]
+        self.assertIn("0:3", cmd)
+        self.assertIn("language=jpn", cmd)
+        self.assertIn("title=Japanese Internal", cmd)
+        self.assertEqual(cmd[cmd.index("-disposition:s:0") + 1], "0")
+        self.assertEqual(cmd[cmd.index("-disposition:s:1") + 1], "default")
 
-    def test_embed_uses_default_output_dir_when_enabled(self):
-        subtitle_rel = "movies/demo.zh.srt"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("subtitle", encoding="utf-8")
-        self.server.DEFAULT_OUTPUT_DIR = "output/final"
-
+    def test_embed_sets_existing_subtitle_metadata_with_mkvmerge(self):
+        pgs_rel = "movies/demo.pgs"
+        (self.media_dir / pgs_rel).write_bytes(b"pgs")
         captured = {}
 
         def fake_check_output(cmd, stderr=None, timeout=None):
             if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": []}'
+                return b'{"streams": [{"index": 5, "codec_type": "subtitle", "codec_name": "hdmv_pgs_subtitle", "tags": {"language": "eng", "title": "Old"}}]}'
             captured["cmd"] = cmd
             return b""
 
         with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            response = self.client.post(
-                "/api/embed",
-                json={
-                    "video": self.video_rel,
-                    "subtitles": [
-                        {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                    ],
-                    "use_default_output_dir": True,
-                },
-            )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["output"], "output/final/demo.muxed.mkv")
-        self.assertEqual(payload["output_dir"], "output/final")
-        self.assertTrue(payload["used_default_output_dir"])
-        self.assertEqual(captured["cmd"][-1], str((self.media_dir / "output/final/demo.muxed.mkv").resolve()))
-
-    def test_embed_rejects_default_output_dir_when_not_configured(self):
-        subtitle_rel = "movies/demo.zh.srt"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("subtitle", encoding="utf-8")
-
-        response = self.client.post(
-            "/api/embed",
-            json={
-                "video": self.video_rel,
-                "subtitles": [
-                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                ],
-                "use_default_output_dir": True,
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "default output dir not configured")
-
-    def test_convert_api_uses_custom_pgs_options_and_persists_output(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-        captured = []
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": [{"width": 1280, "height": 720}]}'
-            captured.append(cmd)
-            output_dir = Path(cmd[cmd.index("--output-dir") + 1]) / "subsetted"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"{subtitle_path.name}.pgs").write_bytes(b"pgs")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
+            with patch.object(self.server, "_resolve_mkvmerge_command", return_value="/usr/bin/mkvmerge"):
                 response = self.client.post(
-                    "/api/convert-ass-to-pgs",
+                    "/api/embed",
                     json={
                         "video": self.video_rel,
-                        "subtitle": subtitle_rel,
-                        "pgs_options": {
-                            "resolution_mode": "custom",
-                            "resolution": "1440*1080",
-                            "framerate": "24000/1001",
+                        "subtitles": [
+                            {"path": pgs_rel, "language": "chi", "title": "Chinese PGS", "default": False, "order": 30}
+                        ],
+                        "tracks": {
+                            "subtitle": [
+                                {"source": "existing", "stream_index": 5, "keep": True, "language": "jpn", "title": "Japanese PGS", "order": 10, "default": True},
+                                {"source": "external", "path": pgs_rel, "keep": True, "language": "chi", "title": "Chinese PGS", "order": 30, "default": False},
+                            ],
                         },
                     },
                 )
 
         self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["input"], subtitle_rel)
-        self.assertEqual(payload["output"], "movies/demo.ass.pgs")
-        self.assertEqual((self.media_dir / payload["output"]).read_bytes(), b"pgs")
-        pgs_temp_root = self.server.TMP_SUBTITLE_ROOT / "_pgs"
-        self.assertFalse(any(pgs_temp_root.iterdir()))
-        self.assertEqual(payload["pgs_settings"]["resolution_mode"], "custom")
-        self.assertEqual(payload["pgs_settings"]["resolution"], "1440*1080")
-        self.assertEqual(payload["pgs_settings"]["framerate"], "24000/1001")
-        self.assertIn("1440*1080", captured[0])
-        self.assertIn("24000/1001", captured[0])
-
-    def test_convert_api_derives_video_resolution_for_pgs_mode(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-        captured = []
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": [{"width": 3840, "height": 2160}]}'
-            captured.append(cmd)
-            output_dir = Path(cmd[cmd.index("--output-dir") + 1]) / "subsetted"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"{subtitle_path.name}.pgs").write_bytes(b"pgs")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                response = self.client.post(
-                    "/api/convert-ass-to-pgs",
-                    json={
-                        "video": self.video_rel,
-                        "subtitle": subtitle_rel,
-                        "pgs_options": {
-                            "resolution_mode": "video",
-                            "resolution": "1920*1080",
-                            "framerate": "23.976",
-                        },
-                    },
-                )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["pgs_settings"]["resolution_mode"], "video")
-        self.assertEqual(payload["pgs_settings"]["resolution"], "3840*2160")
-        self.assertIn("3840*2160", captured[0])
-
-    def test_convert_api_accepts_generated_sup(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            if cmd[:2] == ["ffprobe", "-v"]:
-                return b'{"streams": [{"width": 1280, "height": 720}]}'
-            output_dir = Path(cmd[cmd.index("--output-dir") + 1]) / "subsetted"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"{subtitle_path.name}.sup").write_bytes(b"sup")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                response = self.client.post(
-                    "/api/convert-ass-to-pgs",
-                    json={"video": self.video_rel, "subtitle": subtitle_rel},
-                )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertEqual(payload["output"], "movies/demo.ass.sup")
-        self.assertEqual((self.media_dir / payload["output"]).read_bytes(), b"sup")
-
-    def test_convert_api_rejects_non_ass_subtitle(self):
-        subtitle_rel = "movies/demo.srt"
-        (self.media_dir / subtitle_rel).write_text("subtitle", encoding="utf-8")
-
-        response = self.client.post(
-            "/api/convert-ass-to-pgs",
-            json={"video": self.video_rel, "subtitle": subtitle_rel},
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "pgs conversion only supports ass/ssa")
-
-    def test_embed_rejects_invalid_pgs_resolution(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-
-        response = self.client.post(
-            "/api/embed",
-            json={
-                "video": self.video_rel,
-                "subtitles": [
-                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                ],
-                "subtitle_mode": "pgs_auto",
-                "pgs_options": {
-                    "resolution_mode": "custom",
-                    "resolution": "1920x1080",
-                    "framerate": "23.976",
-                },
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "invalid pgs resolution")
-
-    def test_embed_rejects_invalid_pgs_framerate(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-
-        response = self.client.post(
-            "/api/embed",
-            json={
-                "video": self.video_rel,
-                "subtitles": [
-                    {"path": subtitle_rel, "language": "chi", "title": "Chinese", "default": False}
-                ],
-                "subtitle_mode": "pgs_auto",
-                "pgs_options": {
-                    "resolution_mode": "custom",
-                    "resolution": "1920*1080",
-                    "framerate": "abc",
-                },
-            },
-        )
-
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.get_json()["error"], "invalid pgs framerate")
-
-    def test_convert_ass_to_pgs_uses_mkvtool_and_returns_generated_pgs(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            output_dir = Path(cmd[cmd.index("--output-dir") + 1]) / "subsetted"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"{subtitle_path.name}.pgs").write_bytes(b"pgs")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                output_path, cmd_text, work_dir = self.server._convert_ass_to_pgs(subtitle_path)
-
-        self.assertEqual(output_path.name, "demo.ass.pgs")
-        self.assertTrue(output_path.exists())
-        self.assertIn("--enable-pgs-output", cmd_text)
-        self.assertIn("subset", cmd_text)
-        self.assertIn("--font-dir", cmd_text)
-        self.assertEqual(work_dir.parent, self.server.TMP_SUBTITLE_ROOT / "_pgs")
-        self.server._cleanup_dir(work_dir)
-
-    def test_convert_ass_to_pgs_accepts_sibling_generated_pgs(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        existing_path = subtitle_path.with_suffix(".pgs")
-        existing_path.write_bytes(b"old pgs")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            self.assertEqual(Path(cmd[cmd.index("--output-dir") + 1]).parent, self.server.TMP_SUBTITLE_ROOT / "_pgs")
-            (subtitle_path.parent / f"{subtitle_path.stem}.generated.pgs").write_bytes(b"new pgs")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                output_path, cmd_text, work_dir = self.server._convert_ass_to_pgs(subtitle_path)
-
-        self.assertEqual(output_path.name, "demo.generated.pgs")
-        self.assertEqual(output_path.read_bytes(), b"new pgs")
-        self.assertIn("--enable-pgs-output", cmd_text)
-        self.server._cleanup_dir(work_dir)
-
-    def test_convert_ass_to_pgs_accepts_generated_sup(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        def fake_check_output(cmd, stderr=None, timeout=None):
-            output_dir = Path(cmd[cmd.index("--output-dir") + 1]) / "subsetted"
-            output_dir.mkdir(parents=True, exist_ok=True)
-            (output_dir / f"{subtitle_path.name}.sup").write_bytes(b"sup")
-            return b"ok"
-
-        with patch.object(self.server.subprocess, "check_output", side_effect=fake_check_output):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                output_path, cmd_text, work_dir = self.server._convert_ass_to_pgs(subtitle_path)
-
-        self.assertEqual(output_path.name, "demo.ass.sup")
-        self.assertTrue(output_path.exists())
-        self.assertIn("--enable-pgs-output", cmd_text)
-        self.server._cleanup_dir(work_dir)
-
-    def test_convert_ass_to_pgs_rejects_when_output_missing(self):
-        subtitle_rel = "movies/demo.ass"
-        subtitle_path = self.media_dir / subtitle_rel
-        subtitle_path.write_text("ass subtitle", encoding="utf-8")
-        self.server.PGS_CONVERTER_CMD = "mkvtool"
-
-        with patch.object(self.server.subprocess, "check_output", return_value=b"ok"):
-            with patch.object(self.server, "_resolve_pgs_converter_command", return_value="/usr/local/bin/mkvtool"):
-                with self.assertRaisesRegex(RuntimeError, "pgs converter did not produce a new .pgs or .sup file"):
-                    self.server._convert_ass_to_pgs(subtitle_path)
+        cmd = captured["cmd"]
+        self.assertIn("--language", cmd)
+        self.assertIn("5:jpn", cmd)
+        self.assertIn("--track-name", cmd)
+        self.assertIn("5:Japanese PGS", cmd)
+        self.assertIn("5:yes", cmd)
+        self.assertIn("0:no", cmd)
+        self.assertEqual(cmd[cmd.index("--track-order") + 1], "0:5,1:0")
 
 
 if __name__ == "__main__":

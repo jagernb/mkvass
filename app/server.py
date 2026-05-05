@@ -653,6 +653,12 @@ def _build_mkvmerge_embed_command(video: Path, out_path: Path, prepared_subs: li
     for item in mux_plan["audio"]:
         cmd += ["--default-track-flag", f"{item['stream_index']}:{'yes' if item.get('default') else 'no'}"]
     for item in existing_subtitle_items:
+        meta = item["meta"]
+        lang = meta.get("language") or "und"
+        title = meta.get("title") or ""
+        cmd += ["--language", f"{item['stream_index']}:{lang}"]
+        if title:
+            cmd += ["--track-name", f"{item['stream_index']}:{title}"]
         cmd += ["--default-track-flag", f"{item['stream_index']}:{'yes' if item.get('default') else 'no'}"]
     cmd.append(str(video))
 

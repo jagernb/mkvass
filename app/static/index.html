@@ -565,8 +565,8 @@ function renderDetail(entry, probe) {
       <td><input type="checkbox" class="track-subtitle-keep" checked data-stream-index="${s.index}"></td>
       <td>#${s.index}</td>
       <td>${escapeHtml(s.codec || '')}</td>
-      <td>${escapeHtml(s.language || '')}</td>
-      <td>${escapeHtml(s.title || '')}</td>
+      <td><input type="text" class="track-subtitle-lang" value="${escapeHtml(s.language || 'und')}" style="width:100px"></td>
+      <td><input type="text" class="track-subtitle-title" value="${escapeHtml(s.title || '')}" style="width:140px"></td>
       <td><input type="number" class="track-subtitle-order" value="${500 + (i + 1) * 10}" style="width:70px"></td>
       <td><input type="radio" name="defaultSubtitle" class="track-subtitle-default" ${s.disposition?.default ? 'checked' : ''}></td>
       <td>
@@ -829,6 +829,8 @@ async function doEmbed(entry) {
       source: 'existing',
       stream_index: Number(cb.dataset.streamIndex),
       keep: cb.checked,
+      language: row.querySelector('.track-subtitle-lang').value || 'und',
+      title: row.querySelector('.track-subtitle-title').value || '',
       order: Number(row.querySelector('.track-subtitle-order').value || 0),
       default: row.querySelector('.track-subtitle-default').checked,
     };
