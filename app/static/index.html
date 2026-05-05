@@ -259,6 +259,53 @@ function basename(path) {
   return String(path || '').split(/[\\/]/).pop() || path || '';
 }
 
+function filenameStem(path) {
+  const name = basename(path);
+  const index = name.lastIndexOf('.');
+  return index >= 0 ? name.slice(0, index) : name;
+}
+
+function episodeTokens(name) {
+  const text = filenameStem(name).toLowerCase();
+  const tokens = [];
+  for (const match of text.matchAll(/s(\d{1,2})\s*e(\d{1,3})/gi)) {
+    tokens.push(`s${match[1].padStart(2, '0')}e${match[2].padStart(2, '0')}`);
+  }
+  for (const match of text.matchAll(/(\d{1,2})\s*x\s*(\d{1,3})/gi)) {
+    tokens.push(`s${match[1].padStart(2, '0')}e${match[2].padStart(2, '0')}`);
+  }
+  return [...new Set(tokens)];
+}
+
+function normalizedMediaTokens(name) {
+  const ignored = new Set(['ass', 'ssa', 'srt', 'sup', 'pgs', 'vtt', 'sub', 'zh', 'zhi', 'chi', 'chs', 'cht', 'sc', 'tc', 'cn', 'gb', 'big5', 'eng', 'en', '双语', '简英', '简体中文', '繁体中文']);
+  return filenameStem(name)
+    .toLowerCase()
+    .replace(/s\d{1,2}\s*e\d{1,3}/gi, ' ')
+    .replace(/\d{1,2}\s*x\s*\d{1,3}/gi, ' ')
+    .split(/[^a-z0-9一-龥]+/)
+    .filter(token => token && !ignored.has(token));
+}
+
+function mostlyMatchesVideoSubtitle(videoEntry, subtitleEntry) {
+  const videoName = videoEntry?.name || videoEntry?.path || '';
+  const subtitleName = subtitleEntry?.name || subtitleEntry?.path || '';
+  const videoEpisodes = episodeTokens(videoName);
+  const subtitleEpisodes = episodeTokens(subtitleName);
+  if (videoEpisodes.length || subtitleEpisodes.length) {
+    return videoEpisodes.length > 0 && subtitleEpisodes.some(token => videoEpisodes.includes(token));
+  }
+
+  const videoTokens = normalizedMediaTokens(videoName);
+  const subtitleTokens = normalizedMediaTokens(subtitleName);
+  if (!videoTokens.length || !subtitleTokens.length) return false;
+  const videoStem = videoTokens.join(' ');
+  const subtitleStem = subtitleTokens.join(' ');
+  if (videoStem === subtitleStem || videoStem.startsWith(subtitleStem) || subtitleStem.startsWith(videoStem)) return true;
+  const overlap = subtitleTokens.filter(token => videoTokens.includes(token)).length;
+  return overlap / Math.max(videoTokens.length, subtitleTokens.length) >= 0.6;
+}
+
 function standalonePgsDefaults() {
   return {
     resolution: '1920*1080',
@@ -544,7 +591,9 @@ function renderDetail(entry, probe) {
   const audios = probe.audios || [];
   const subs = probe.subtitles || [];
 
-  const siblingSubs = state.entries.filter(e => e.role === 'subtitle');
+  const siblingSubs = state.entries
+    .filter(e => e.role === 'subtitle')
+    .filter(s => mostlyMatchesVideoSubtitle(entry, s));
   const uploadedSubs = probe.uploaded_subtitles || [];
   const embedCandidates = [...siblingSubs, ...uploadedSubs];
 
@@ -585,8 +634,8 @@ function renderDetail(entry, probe) {
        ${sourceTag}
        ${escapeHtml(s.name)}
        <input type="number" placeholder="顺序" class="embed-order" style="width:70px" value="${1000 + (i + 1) * 10}">
-       <input type="text" placeholder="语言(如 chi/eng)" class="embed-lang" style="width:100px" value="und">
-       <input type="text" placeholder="标题" class="embed-title" style="width:140px">
+       <input type="text" list="embedLangPresets" placeholder="语言(如 zhi/eng)" class="embed-lang" style="width:100px" value="zhi">
+       <input type="text" list="embedTitlePresets" placeholder="标题" class="embed-title" style="width:140px">
        <label class="muted"><input type="radio" name="defaultSubtitle" class="embed-default"> 默认</label>
      </label>`;
   }).join('');
@@ -641,6 +690,15 @@ function renderDetail(entry, probe) {
         <input type="file" id="uploadSubtitleFile" accept=".srt,.ass,.ssa,.vtt,.sub">
         <button id="uploadSubtitleBtn" class="secondary">上传到临时区</button>
       </div>
+      <datalist id="embedLangPresets">
+        <option value="zhi"></option>
+        <option value=" " label="空白"></option>
+      </datalist>
+      <datalist id="embedTitlePresets">
+        <option value="双语简英"></option>
+        <option value="简体中文"></option>
+        <option value=" " label="空白"></option>
+      </datalist>
       ${subOptions}
       <div class="row" style="margin-top:10px">
         <label><input type="checkbox" id="keepExisting" checked> 保留原有内封字幕</label>
@@ -840,8 +898,8 @@ async function doEmbed(entry) {
     return {
       path: cb.dataset.path,
       ext: cb.dataset.ext,
-      language: row.querySelector('.embed-lang').value || 'und',
-      title: row.querySelector('.embed-title').value || '',
+      language: row.querySelector('.embed-lang').value,
+      title: row.querySelector('.embed-title').value,
       order: Number(row.querySelector('.embed-order').value || 0),
       default: row.querySelector('.embed-default').checked,
     };
