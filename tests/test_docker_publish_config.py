@@ -19,8 +19,9 @@ class DockerPublishingConfigTests(unittest.TestCase):
         self.assertIn('git clone --depth 1 --branch "${MKVAUTOSUBSET_REF}"', dockerfile)
         self.assertIn("go build -mod=mod", dockerfile)
         self.assertIn("CGO_ENABLED=1", dockerfile)
-        self.assertIn('CGO_CFLAGS="-O3 -DHB_EXPERIMENTAL_API"', dockerfile)
-        self.assertIn('CGO_LDFLAGS="-lass', dockerfile)
+        self.assertIn('FROM ac79b0c6/mkvtool-builder:next AS mkvtool-builder', dockerfile)
+        self.assertIn('CGO_CFLAGS="-O3 -I/deps/x86_64-linux/include -DHB_EXPERIMENTAL_API"', dockerfile)
+        self.assertIn('CGO_LDFLAGS="-L/deps/x86_64-linux/lib', dockerfile)
         self.assertIn("COPY --from=mkvtool-builder", dockerfile)
         self.assertIn("PGS_CONVERTER_CMD=mkvtool", dockerfile)
 

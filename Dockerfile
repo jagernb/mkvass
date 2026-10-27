@@ -1,29 +1,21 @@
-FROM golang:1.23-bookworm AS mkvtool-builder
+FROM alpine/git:2.47.2 AS mkvtool-source
 
 ARG MKVAUTOSUBSET_REPO=https://github.com/SAGIRIxr/MkvAutoSubset.git
 ARG MKVAUTOSUBSET_REF=next
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-        build-essential \
-        git \
-        pkg-config \
-        libass-dev \
-        libexpat1-dev \
-        libfontconfig1-dev \
-        libfreetype-dev \
-        libfribidi-dev \
-        libharfbuzz-dev \
-        libpng-dev \
-        zlib1g-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && git clone --depth 1 --branch "${MKVAUTOSUBSET_REF}" "${MKVAUTOSUBSET_REPO}" /src/MkvAutoSubset
+RUN git clone --depth 1 --branch "${MKVAUTOSUBSET_REF}" "${MKVAUTOSUBSET_REPO}" /src/MkvAutoSubset
 
+FROM ac79b0c6/mkvtool-builder:next AS mkvtool-builder
+
+COPY --from=mkvtool-source /src/MkvAutoSubset /src/MkvAutoSubset
 WORKDIR /src/MkvAutoSubset/mkvtool
 
 RUN CGO_ENABLED=1 \
-    CGO_CFLAGS="-O3 -DHB_EXPERIMENTAL_API" \
-    CGO_LDFLAGS="-lass -lfreetype -lm -lz -lfontconfig -lpng -lfribidi -lharfbuzz -lharfbuzz-subset -lexpat" \
+    GOOS=linux \
+    GOARCH=amd64 \
+    CC="zig cc -target x86_64-linux" \
+    CGO_CFLAGS="-O3 -I/deps/x86_64-linux/include -DHB_EXPERIMENTAL_API" \
+    CGO_LDFLAGS="-L/deps/x86_64-linux/lib -lstdc++ -lfribidi -lzlib -lfreetype -lpng -lharfbuzz -lharfbuzz-subset -lass" \
     go build -mod=mod -ldflags "-s -w" -o /usr/local/bin/mkvtool
 
 FROM python:3.12-slim
